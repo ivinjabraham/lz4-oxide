@@ -1,0 +1,8 @@
+/target
+
+# Transient output of `make abi-check` (the Rust side of the comparison).
+# The committed abi.txt is the reference contract and IS tracked.
+/abi.rust.txt
+
+*.o
+*.a

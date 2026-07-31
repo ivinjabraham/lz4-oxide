@@ -1,0 +1,34 @@
+[package]
+name = "lz4_rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "BSD-2-Clause"
+description = "Rust port of the LZ4 compression library, ABI-compatible with liblz4"
+
+# staticlib => target/<profile>/liblz4_rs.a, which the original C test suite
+# links in place of the C objects. cdylib is here for the shared-library and
+# CLI test paths.
+[lib]
+name = "lz4_rs"
+path = "src/lib.rs"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+# XXH32 is required by the LZ4 frame format (block + content checksums);
+# XXH64 is used directly by the original test harness. See DECISIONS.md.
+xxhash-rust = { version = "0.8", features = ["xxh32", "xxh64"] }
+
+[build-dependencies]
+cc = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# The C test harness has no Rust unwinder; abort keeps the ABI boundary simple
+# and makes an unimplemented!() stub fail loudly instead of unwinding into C.
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
