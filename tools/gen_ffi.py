@@ -253,9 +253,13 @@ def main():
 
     print(f"resolved : {len(resolved)}/{len(want)}")
     if missing:
-        print(f"MISSING  : {len(missing)}")
+        # Exit non-zero. A symbol the archive exports but we generate no stub
+        # for links fine and then misbehaves at runtime, so this has to stop
+        # the build rather than scroll past in the log.
+        print(f"MISSING  : {len(missing)} exported symbols have no generated stub")
         for m in missing:
             print(f"    {m}")
+        return 1
     return 0
 
 
