@@ -211,6 +211,18 @@ get made, and therefore the compressed bytes. Keep `MFLIMIT`, `LASTLITERALS`,
 `MINMATCH`, `WILDCOPYLENGTH` and every `ip < ilimit`-style guard exactly as
 written, even where the reason for a particular `-5` or `-12` is not obvious.
 
+> ⚠️ **"It's only a fast path" is a claim to check, not to assume.** The
+> decoder's two-stage shortcut (`lz4.c:2241-2272`) looks like pure speed work
+> sitting in front of the general path, and it is tempting to skip it. It is
+> **not** equivalent. Its guard is `ip < iend-16`, which is weaker than the
+> general path's parsing restriction (`ip + length > iend - 8`), so it accepts
+> sequences the general path rejects — including on corrupt input, where it is
+> the difference between decoding a block and returning an error. Skipping it
+> made this port reject a block C decoded to 29643 bytes.
+>
+> The same care applies to `LZ4_FAST_DEC_LOOP`. Only the *copies* are
+> optimisations; the control flow and bounds tests around them are semantics.
+
 ### 3.3 `tableType` decides everything — read this before you write a hash
 
 There is no single "the hash". `LZ4_compress_generic` is instantiated per

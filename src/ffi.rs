@@ -16,6 +16,75 @@ use core::ffi::{c_char, c_double, c_float, c_int, c_long, c_longlong,
 
 use crate::types::*;
 
+use crate::block::{self, Error as BlockError, Input};
+use core::ops::Range;
+use core::slice;
+
+/// Hand the caller's two buffers to `f` in a representation that never aliases.
+///
+/// `src` and `dst` may point into the **same allocation**: in-place
+/// compression (`fuzzer.c:1207-1218`) and decompression (`:1240-1247`) are
+/// supported features, not misuse. Holding `&[u8]` and `&mut [u8]` over the
+/// same bytes is undefined behaviour, so when the ranges overlap we produce a
+/// single slice spanning both, plus indices into it.
+///
+/// # Safety
+///
+/// The usual C contract: each pointer is either null with a zero length, or
+/// valid for the stated number of bytes. When the ranges overlap they must be
+/// part of one allocation, which is what the in-place API contract
+/// (`LZ4_COMPRESS_INPLACE_BUFFER_SIZE`, `lz4.h:672-680`) already requires.
+unsafe fn with_buffers<R>(
+    src: *const c_char,
+    src_len: usize,
+    dst: *mut c_char,
+    dst_len: usize,
+    f: impl FnOnce(&mut [u8], Range<usize>, &Input<'_>) -> R,
+) -> R {
+    let src_addr = src as usize;
+    let dst_addr = dst as usize;
+    let overlaps = src_len != 0
+        && dst_len != 0
+        && src_addr < dst_addr.wrapping_add(dst_len)
+        && dst_addr < src_addr.wrapping_add(src_len);
+
+    if overlaps {
+        let lo = src_addr.min(dst_addr);
+        let hi = (src_addr + src_len).max(dst_addr + dst_len);
+        let buf = slice::from_raw_parts_mut(lo as *mut u8, hi - lo);
+        let s = (src_addr - lo)..(src_addr - lo + src_len);
+        let d = (dst_addr - lo)..(dst_addr - lo + dst_len);
+        f(buf, d, &Input::Within(s))
+    } else {
+        // `from_raw_parts` requires non-null even for length 0, and
+        // `LZ4_compress_default(NULL, dst, 0, cap)` is a supported call.
+        let s: &[u8] = if src.is_null() || src_len == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(src as *const u8, src_len)
+        };
+        let d: &mut [u8] = if dst.is_null() || dst_len == 0 {
+            &mut []
+        } else {
+            slice::from_raw_parts_mut(dst as *mut u8, dst_len)
+        };
+        let range = 0..d.len();
+        f(d, range, &Input::Separate(s))
+    }
+}
+
+/// `Result` in, C integer convention out — done once, per function, because
+/// the conventions differ between families (DECISIONS.md §7.1).
+#[inline]
+fn decode_result(r: Result<usize, BlockError>) -> c_int {
+    match r {
+        Ok(n) => n as c_int,
+        // lz4.c:2462 encodes *where* parsing failed: `-(ip - src) - 1`.
+        Err(BlockError::Malformed { consumed }) => -(consumed as c_int) - 1,
+        Err(BlockError::OutputTooSmall) => -1,
+    }
+}
+
 /// from lib/lz4frame.h
 #[no_mangle]
 pub extern "C" fn LZ4F_cctx_size(cctx: *const LZ4F_cctx) -> usize {
@@ -379,13 +448,14 @@ pub extern "C" fn LZ4_attach_dictionary(workingStream: *mut LZ4_stream_t, dictio
 /// from lib/lz4.h
 #[no_mangle]
 pub extern "C" fn LZ4_compress(src: *const c_char, dest: *mut c_char, srcSize: c_int) -> c_int {
-    unimplemented!("LZ4_compress")
+    // lz4.c:2787 — deprecated alias.
+    LZ4_compress_default(src, dest, srcSize, LZ4_compressBound(srcSize))
 }
 
 /// from lib/lz4.h
 #[no_mangle]
 pub extern "C" fn LZ4_compressBound(inputSize: c_int) -> c_int {
-    unimplemented!("LZ4_compressBound")
+    block::compress_bound(inputSize)
 }
 
 /// from lib/lz4hc.h
@@ -505,7 +575,8 @@ pub extern "C" fn LZ4_compress_continue(LZ4_streamPtr: *mut LZ4_stream_t, source
 /// from lib/lz4.h
 #[no_mangle]
 pub extern "C" fn LZ4_compress_default(src: *const c_char, dst: *mut c_char, srcSize: c_int, dstCapacity: c_int) -> c_int {
-    unimplemented!("LZ4_compress_default")
+    // lz4.c:1481 — acceleration 1.
+    LZ4_compress_fast(src, dst, srcSize, dstCapacity, 1)
 }
 
 /// from lib/lz4.h
@@ -523,7 +594,23 @@ pub extern "C" fn LZ4_compress_destSize_extState(state: *mut c_void, src: *const
 /// from lib/lz4.h
 #[no_mangle]
 pub extern "C" fn LZ4_compress_fast(src: *const c_char, dst: *mut c_char, srcSize: c_int, dstCapacity: c_int, acceleration: c_int) -> c_int {
-    unimplemented!("LZ4_compress_fast")
+    // A negative srcSize fails C's unsigned `> LZ4_MAX_INPUT_SIZE` test and
+    // returns 0 (lz4.c:1369); the compress family never returns negative.
+    if srcSize < 0 || (srcSize as u32) > block::LZ4_MAX_INPUT_SIZE || dstCapacity < 0 {
+        return 0;
+    }
+    unsafe {
+        with_buffers(
+            src,
+            srcSize as usize,
+            dst,
+            dstCapacity as usize,
+            |buf, d, input| match block::compress_fast(buf, d, input, acceleration) {
+                Ok(n) => n as c_int,
+                Err(_) => 0,
+            },
+        )
+    }
 }
 
 /// from lib/lz4.h
@@ -535,6 +622,13 @@ pub extern "C" fn LZ4_compress_fast_continue(streamPtr: *mut LZ4_stream_t, src: 
 /// from lib/lz4.h
 #[no_mangle]
 pub extern "C" fn LZ4_compress_fast_extState(state: *mut c_void, src: *const c_char, dst: *mut c_char, srcSize: c_int, dstCapacity: c_int, acceleration: c_int) -> c_int {
+    // Deferred with streaming, not overlooked: unlike LZ4_compress_fast (which
+    // may use a table of our own choosing, since only the table's *contents*
+    // affect the output), this one must read and write the caller's
+    // LZ4_stream_t. That means pinning down LZ4_stream_t_internal's layout,
+    // which is the same work LZ4_loadDict / LZ4_compress_fast_continue need.
+    // LZ4_compress_withState and LZ4_compress_limitedOutput_withState
+    // (lz4.c:2791, :2795) are blocked on this too.
     unimplemented!("LZ4_compress_fast_extState")
 }
 
@@ -553,7 +647,8 @@ pub extern "C" fn LZ4_compress_forceExtDict(LZ4_dict: *mut LZ4_stream_t, source:
 /// from lib/lz4.h
 #[no_mangle]
 pub extern "C" fn LZ4_compress_limitedOutput(src: *const c_char, dest: *mut c_char, srcSize: c_int, maxOutputSize: c_int) -> c_int {
-    unimplemented!("LZ4_compress_limitedOutput")
+    // lz4.c:2783 — deprecated alias.
+    LZ4_compress_default(src, dest, srcSize, maxOutputSize)
 }
 
 /// from lib/lz4.h
@@ -637,7 +732,20 @@ pub extern "C" fn LZ4_decompress_fast_withPrefix64k(src: *const c_char, dst: *mu
 /// from lib/lz4.h
 #[no_mangle]
 pub extern "C" fn LZ4_decompress_safe(src: *const c_char, dst: *mut c_char, compressedSize: c_int, dstCapacity: c_int) -> c_int {
-    unimplemented!("LZ4_decompress_safe")
+    // lz4.c:2035 — `src == NULL` or a negative output size is a flat -1,
+    // before any position-encoded error can arise.
+    if src.is_null() || dstCapacity < 0 || compressedSize < 0 {
+        return -1;
+    }
+    unsafe {
+        with_buffers(
+            src,
+            compressedSize as usize,
+            dst,
+            dstCapacity as usize,
+            |buf, d, input| decode_result(block::decompress_generic(buf, d, input, false, 0)),
+        )
+    }
 }
 
 /// from lib/lz4.h
@@ -655,7 +763,28 @@ pub extern "C" fn LZ4_decompress_safe_forceExtDict(source: *const c_char, dest: 
 /// from lib/lz4.h
 #[no_mangle]
 pub extern "C" fn LZ4_decompress_safe_partial(src: *const c_char, dst: *mut c_char, srcSize: c_int, targetOutputSize: c_int, dstCapacity: c_int) -> c_int {
-    unimplemented!("LZ4_decompress_safe_partial")
+    // lz4.c:2480 takes MIN(targetOutputSize, dstCapacity) as the output size,
+    // so a negative target reaches the `outputSize < 0` check and yields -1.
+    if src.is_null() || dstCapacity < 0 || targetOutputSize < 0 || srcSize < 0 {
+        return -1;
+    }
+    unsafe {
+        with_buffers(
+            src,
+            srcSize as usize,
+            dst,
+            dstCapacity as usize,
+            |buf, d, input| {
+                decode_result(block::decompress_generic(
+                    buf,
+                    d,
+                    input,
+                    true,
+                    targetOutputSize as usize,
+                ))
+            },
+        )
+    }
 }
 
 /// from lib/lz4.c
@@ -805,7 +934,8 @@ pub extern "C" fn LZ4_setStreamDecode(LZ4_streamDecode: *mut LZ4_streamDecode_t,
 /// from lib/lz4.h
 #[no_mangle]
 pub extern "C" fn LZ4_sizeofState() -> c_int {
-    unimplemented!("LZ4_sizeofState")
+    // lz4.c:761 — `sizeof(LZ4_stream_t)`, probed from the real header.
+    LZ4_STREAM_SIZE as c_int
 }
 
 /// from lib/lz4hc.h
@@ -847,7 +977,8 @@ pub extern "C" fn LZ4_uncompress(source: *const c_char, dest: *mut c_char, outpu
 /// from lib/lz4.h
 #[no_mangle]
 pub extern "C" fn LZ4_uncompress_unknownOutputSize(source: *const c_char, dest: *mut c_char, isize: c_int, maxOutputSize: c_int) -> c_int {
-    unimplemented!("LZ4_uncompress_unknownOutputSize")
+    // lz4.c:2818 — deprecated alias.
+    LZ4_decompress_safe(source, dest, isize, maxOutputSize)
 }
 
 /// from lib/lz4.h
