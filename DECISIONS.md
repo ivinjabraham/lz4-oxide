@@ -154,15 +154,18 @@ semantics, and its test suite. We did not read or depend on `lz4_flex`.
 
 This needed care, because the obvious approach silently does nothing.
 
-**The trap.** lz4's tests do *not* link `liblz4.a`. `tests/Makefile:122` builds
+**The trap:** lz4's tests do *not* link against a prebuilt library, The Makefile instead builds its own test binaries by compiling the c source files:
+
+`tests/Makefile:122` builds
 `fuzzer` from `lz4.o lz4hc.o xxhash.o fuzzer.o`, and
 `build/make/multiconf.make:148` resolves those through
-`vpath %.c $(C_SRCDIRS)`, where `C_SRCDIRS = ../lib ../programs .`. A Rust
-`liblz4.a` dropped into `lib/` would be **bypassed entirely** — the C sources
-would still be compiled, the tests would pass, and they would be testing
-nothing. Verify with `make -C tests --dry-run fuzzer`.
+`vpath %.c $(C_SRCDIRS)`, where `C_SRCDIRS = ../lib ../programs .`.
 
-**The hook.** Two ordinary make variables, overridden on the command line:
+A Rust library dropped into `lib/` would be **bypassed entirely** as the C sources
+would still be compiled, the tests would pass, and they would be testing
+nothing.
+
+**The solution:.** Two ordinary make variables, overridden on the command line:
 
 ```sh
 make -C tests test \
@@ -170,7 +173,7 @@ make -C tests test \
   LDLIBS="$LZ4_OXIDE/target/release/liblz4_rs.a $(rustc --print native-static-libs ...)"
 ```
 
-* `C_SRCDIRS` drops `../lib` and substitutes `cstub/`, which holds five
+* `C_SRCDIRS` drops the upstream `../lib` and substitutes `cstub/`, which holds five
   intentionally-empty translation units (`lz4.c`, `lz4hc.c`, `lz4frame.c`,
   `lz4file.c`, `xxhash.c`). The object names the makefile expects still get
   produced; no C implementation object is linked into any test binary.

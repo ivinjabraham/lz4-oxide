@@ -24,12 +24,6 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 cc = "1.0"
 
-[dev-dependencies]
-# Not linked into the artifact -- an independent oracle for unit tests, so our
-# hand-written XXH32/XXH64 is checked against a second implementation rather
-# than only against itself.
-xxhash-rust = { version = "0.8", features = ["xxh32", "xxh64"] }
-
 [profile.release]
 opt-level = 3
 lto = true

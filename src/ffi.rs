@@ -319,118 +319,180 @@ pub extern "C" fn LZ4F_writeOpen(lz4fWrite: *mut *mut LZ4_writeFile_t, fp: *mut 
     unimplemented!("LZ4F_writeOpen")
 }
 
-/// from lib/xxhash.h
-#[no_mangle]
-pub extern "C" fn LZ4_XXH32(input: *const c_void, length: usize, seed: c_uint) -> XXH32_hash_t {
-    unimplemented!("LZ4_XXH32")
+// ─── XXH helpers ─────────────────────────────────────────────────────────────
+//
+// The opaque storage types (XXH32_state_t, XXH64_state_t) are the same byte
+// size and alignment as the internal Xxh*State structs. types.rs asserts the
+// storage types against the C probe; the asserts below close the loop by
+// pinning the internal structs to the storage types, so the pointer casts
+// here are checked end-to-end at compile time.
+
+use crate::xxh::{Xxh32State, Xxh64State};
+use core::slice;
+
+const _: () = {
+    assert!(core::mem::size_of::<Xxh32State>() == core::mem::size_of::<XXH32_state_t>());
+    assert!(core::mem::align_of::<Xxh32State>() == core::mem::align_of::<XXH32_state_t>());
+    assert!(core::mem::size_of::<Xxh64State>() == core::mem::size_of::<XXH64_state_t>());
+    assert!(core::mem::align_of::<Xxh64State>() == core::mem::align_of::<XXH64_state_t>());
+};
+
+#[inline]
+unsafe fn as_xxh32(p: *mut XXH32_state_t) -> &'static mut Xxh32State {
+    unsafe { &mut *(p as *mut Xxh32State) }
+}
+#[inline]
+unsafe fn as_xxh32_ref(p: *const XXH32_state_t) -> &'static Xxh32State {
+    unsafe { &*(p as *const Xxh32State) }
+}
+#[inline]
+unsafe fn as_xxh64(p: *mut XXH64_state_t) -> &'static mut Xxh64State {
+    unsafe { &mut *(p as *mut Xxh64State) }
+}
+#[inline]
+unsafe fn as_xxh64_ref(p: *const XXH64_state_t) -> &'static Xxh64State {
+    unsafe { &*(p as *const Xxh64State) }
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub extern "C" fn LZ4_XXH32_canonicalFromHash(dst: *mut XXH32_canonical_t, hash: XXH32_hash_t) {
-    unimplemented!("LZ4_XXH32_canonicalFromHash")
+pub unsafe extern "C" fn LZ4_XXH32(input: *const c_void, length: usize, seed: c_uint) -> XXH32_hash_t {
+    let data = if input.is_null() { &[] } else { unsafe { slice::from_raw_parts(input as *const u8, length) } };
+    crate::xxh::xxh32(data, seed)
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub extern "C" fn LZ4_XXH32_copyState(dst_state: *mut XXH32_state_t, src_state: *const XXH32_state_t) {
-    unimplemented!("LZ4_XXH32_copyState")
+pub unsafe extern "C" fn LZ4_XXH32_canonicalFromHash(dst: *mut XXH32_canonical_t, hash: XXH32_hash_t) {
+    unsafe { (*dst).digest = crate::xxh::xxh32_canonical_from_hash(hash); }
 }
 
 /// from lib/xxhash.h
+#[no_mangle]
+pub unsafe extern "C" fn LZ4_XXH32_copyState(dst_state: *mut XXH32_state_t, src_state: *const XXH32_state_t) {
+    unsafe { *as_xxh32(dst_state) = *as_xxh32_ref(src_state); }
+}
+
+/// from lib/xxhash.h — allocates; caller must free with LZ4_XXH32_freeState
 #[no_mangle]
 pub extern "C" fn LZ4_XXH32_createState() -> *mut XXH32_state_t {
-    unimplemented!("LZ4_XXH32_createState")
+    // Safety: Box::into_raw gives us a valid, non-null pointer.
+    let b: Box<Xxh32State> = Box::new(Xxh32State {
+        total_len_32: 0, large_len: 0,
+        v1: 0, v2: 0, v3: 0, v4: 0,
+        mem: [0; 16], memsize: 0, reserved: 0,
+    });
+    Box::into_raw(b) as *mut XXH32_state_t
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub extern "C" fn LZ4_XXH32_digest(statePtr: *const XXH32_state_t) -> XXH32_hash_t {
-    unimplemented!("LZ4_XXH32_digest")
+pub unsafe extern "C" fn LZ4_XXH32_digest(statePtr: *const XXH32_state_t) -> XXH32_hash_t {
+    crate::xxh::xxh32_digest(unsafe { as_xxh32_ref(statePtr) })
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub extern "C" fn LZ4_XXH32_freeState(statePtr: *mut XXH32_state_t) -> XXH_errorcode {
-    unimplemented!("LZ4_XXH32_freeState")
+pub unsafe extern "C" fn LZ4_XXH32_freeState(statePtr: *mut XXH32_state_t) -> XXH_errorcode {
+    if !statePtr.is_null() {
+        unsafe { drop(Box::from_raw(statePtr as *mut Xxh32State)); }
+    }
+    crate::types::XXH_OK
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub extern "C" fn LZ4_XXH32_hashFromCanonical(src: *const XXH32_canonical_t) -> XXH32_hash_t {
-    unimplemented!("LZ4_XXH32_hashFromCanonical")
+pub unsafe extern "C" fn LZ4_XXH32_hashFromCanonical(src: *const XXH32_canonical_t) -> XXH32_hash_t {
+    crate::xxh::xxh32_hash_from_canonical(unsafe { &(*src).digest })
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub extern "C" fn LZ4_XXH32_reset(statePtr: *mut XXH32_state_t, seed: c_uint) -> XXH_errorcode {
-    unimplemented!("LZ4_XXH32_reset")
+pub unsafe extern "C" fn LZ4_XXH32_reset(statePtr: *mut XXH32_state_t, seed: c_uint) -> XXH_errorcode {
+    crate::xxh::xxh32_reset(unsafe { as_xxh32(statePtr) }, seed);
+    crate::types::XXH_OK
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub extern "C" fn LZ4_XXH32_update(statePtr: *mut XXH32_state_t, input: *const c_void, length: usize) -> XXH_errorcode {
-    unimplemented!("LZ4_XXH32_update")
+pub unsafe extern "C" fn LZ4_XXH32_update(statePtr: *mut XXH32_state_t, input: *const c_void, length: usize) -> XXH_errorcode {
+    if input.is_null() { return crate::types::XXH_ERROR; }
+    let data = unsafe { slice::from_raw_parts(input as *const u8, length) };
+    crate::xxh::xxh32_update(unsafe { as_xxh32(statePtr) }, data);
+    crate::types::XXH_OK
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub extern "C" fn LZ4_XXH64(input: *const c_void, length: usize, seed: c_ulonglong) -> XXH64_hash_t {
-    unimplemented!("LZ4_XXH64")
+pub unsafe extern "C" fn LZ4_XXH64(input: *const c_void, length: usize, seed: c_ulonglong) -> XXH64_hash_t {
+    let data = if input.is_null() { &[] } else { unsafe { slice::from_raw_parts(input as *const u8, length) } };
+    crate::xxh::xxh64(data, seed)
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub extern "C" fn LZ4_XXH64_canonicalFromHash(dst: *mut XXH64_canonical_t, hash: XXH64_hash_t) {
-    unimplemented!("LZ4_XXH64_canonicalFromHash")
+pub unsafe extern "C" fn LZ4_XXH64_canonicalFromHash(dst: *mut XXH64_canonical_t, hash: XXH64_hash_t) {
+    unsafe { (*dst).digest = crate::xxh::xxh64_canonical_from_hash(hash); }
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub extern "C" fn LZ4_XXH64_copyState(dst_state: *mut XXH64_state_t, src_state: *const XXH64_state_t) {
-    unimplemented!("LZ4_XXH64_copyState")
+pub unsafe extern "C" fn LZ4_XXH64_copyState(dst_state: *mut XXH64_state_t, src_state: *const XXH64_state_t) {
+    unsafe { *as_xxh64(dst_state) = *as_xxh64_ref(src_state); }
 }
 
-/// from lib/xxhash.h
+/// from lib/xxhash.h — allocates; caller must free with LZ4_XXH64_freeState
 #[no_mangle]
 pub extern "C" fn LZ4_XXH64_createState() -> *mut XXH64_state_t {
-    unimplemented!("LZ4_XXH64_createState")
+    let b: Box<Xxh64State> = Box::new(Xxh64State {
+        total_len: 0,
+        v1: 0, v2: 0, v3: 0, v4: 0,
+        mem: [0; 32], memsize: 0, reserved: [0; 2],
+    });
+    Box::into_raw(b) as *mut XXH64_state_t
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub extern "C" fn LZ4_XXH64_digest(statePtr: *const XXH64_state_t) -> XXH64_hash_t {
-    unimplemented!("LZ4_XXH64_digest")
+pub unsafe extern "C" fn LZ4_XXH64_digest(statePtr: *const XXH64_state_t) -> XXH64_hash_t {
+    crate::xxh::xxh64_digest(unsafe { as_xxh64_ref(statePtr) })
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub extern "C" fn LZ4_XXH64_freeState(statePtr: *mut XXH64_state_t) -> XXH_errorcode {
-    unimplemented!("LZ4_XXH64_freeState")
+pub unsafe extern "C" fn LZ4_XXH64_freeState(statePtr: *mut XXH64_state_t) -> XXH_errorcode {
+    if !statePtr.is_null() {
+        unsafe { drop(Box::from_raw(statePtr as *mut Xxh64State)); }
+    }
+    crate::types::XXH_OK
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub extern "C" fn LZ4_XXH64_hashFromCanonical(src: *const XXH64_canonical_t) -> XXH64_hash_t {
-    unimplemented!("LZ4_XXH64_hashFromCanonical")
+pub unsafe extern "C" fn LZ4_XXH64_hashFromCanonical(src: *const XXH64_canonical_t) -> XXH64_hash_t {
+    crate::xxh::xxh64_hash_from_canonical(unsafe { &(*src).digest })
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub extern "C" fn LZ4_XXH64_reset(statePtr: *mut XXH64_state_t, seed: c_ulonglong) -> XXH_errorcode {
-    unimplemented!("LZ4_XXH64_reset")
+pub unsafe extern "C" fn LZ4_XXH64_reset(statePtr: *mut XXH64_state_t, seed: c_ulonglong) -> XXH_errorcode {
+    crate::xxh::xxh64_reset(unsafe { as_xxh64(statePtr) }, seed);
+    crate::types::XXH_OK
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub extern "C" fn LZ4_XXH64_update(statePtr: *mut XXH64_state_t, input: *const c_void, length: usize) -> XXH_errorcode {
-    unimplemented!("LZ4_XXH64_update")
+pub unsafe extern "C" fn LZ4_XXH64_update(statePtr: *mut XXH64_state_t, input: *const c_void, length: usize) -> XXH_errorcode {
+    if input.is_null() { return crate::types::XXH_ERROR; }
+    let data = unsafe { slice::from_raw_parts(input as *const u8, length) };
+    crate::xxh::xxh64_update(unsafe { as_xxh64(statePtr) }, data);
+    crate::types::XXH_OK
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
 pub extern "C" fn LZ4_XXH_versionNumber() -> c_uint {
-    unimplemented!("LZ4_XXH_versionNumber")
+    crate::xxh::VERSION_NUMBER
 }
 
 /// from lib/lz4hc.h
