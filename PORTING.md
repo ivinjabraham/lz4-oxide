@@ -29,6 +29,23 @@ Two notes:
 - If the fuzzer gets *further* but you cannot tell why it stopped, raise the
   display level: `./upstream/tests/fuzzer -i1 -v`.
 
+> ⚠️ **`make test-reference` overwrites `upstream/tests/fuzzer` with the
+> C-linked build.** The object files live in separate flag-hashed cache
+> directories and coexist fine, but the final binary path is shared, so
+> whichever you built last wins. Run `make test-reference`, then
+> `./upstream/tests/fuzzer -i1`, and you are testing **C** — it will sail past
+> everything and tell you nothing.
+>
+> Always `make link-check` (or `make test`) before running the binary by hand.
+> The one-second check that you have the right one:
+>
+> ```sh
+> strings upstream/tests/fuzzer | grep -c 'not implemented'   # >0 means Rust
+> ```
+>
+> This is the same class of trap as PLAN.md §8, one level further out: not "the
+> tests silently compile C" but "the binary on disk is silently the C one."
+
 ---
 
 ## 2. The boundary
