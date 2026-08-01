@@ -4,6 +4,9 @@ Team roadmap and handoff. If you are picking this up cold, read this file top
 to bottom once; it should take about five minutes.
 
 - **What & how to build** → [README.md](README.md)
+- **How to write the port by hand** → [PORTING.md](PORTING.md) ← read before
+  writing a match loop; it is the list of things that break when you translate
+  *this* C into Rust
 - **Why we made each call** (graded) → [DECISIONS.md](DECISIONS.md)
 - **Status, what's next, who does what** → this file
 

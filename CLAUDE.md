@@ -1,8 +1,9 @@
 # lz4-oxide
 
 Rust port of lz4's C library, ABI-compatible with liblz4, for a hackathon
-(deadline 2026-08-03). **Read [PLAN.md](PLAN.md) first** — status, roadmap and
-task ownership. Rationale lives in [DECISIONS.md](DECISIONS.md).
+(deadline 2026-08-03 18:00 UTC). **Read [PLAN.md](PLAN.md) first** — status,
+roadmap and task ownership. Rationale lives in [DECISIONS.md](DECISIONS.md);
+the porting traps and the byte-identity check are in [PORTING.md](PORTING.md).
 
 ## State
 
