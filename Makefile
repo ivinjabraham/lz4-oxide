@@ -6,7 +6,7 @@
 # So we override two ordinary make variables on the command line:
 #
 #   C_SRCDIRS  drop ../lib, substitute our empty stub translation units, so
-#              the C implementation is never compiled at all.
+#              so no lib/*.c object is ever linked into a test binary.
 #   LDLIBS     multiconf.make:222 appends this to every link line, so our
 #              Rust staticlib satisfies the symbols the C tests reference.
 #

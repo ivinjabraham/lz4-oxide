@@ -20,12 +20,17 @@ against upstream lz4 pinned at `0774d055`.
 | Upstream tree unmodified | `git -C upstream status --short` | **empty** |
 | Original test files match their kickoff hashes | `make kickoff-verify` | **42/42** |
 | `unsafe` confined to `src/ffi.rs` | `make unsafe-count` | **0 occurrences so far** |
+| Every built test binary came from `cstub/`, not `lib/` | `make provenance-check` | **pass** |
 | C reference suite is green *on this host* | `make test-reference` | **exit 0** ([tests/README.md](tests/README.md#the-c-baseline--our-denominator)) |
 
-The third row is the one that matters. Linking proves only that symbol names
-resolved; it does not prove the C harness reaches Rust code. Running the
-resulting binary does — the original `fuzzer` aborts inside our
-`unimplemented!()` stub:
+Two of those rows carry the weight. **Row 3** proves the C harness reaches Rust:
+linking only shows that symbol *names* resolved, whereas running the binary
+shows the original `fuzzer` aborting inside our `unimplemented!()` stub.
+**Row 5** proves the binary it ran was built from our stub directory rather than
+from a cached object compiled out of `lib/` — `multiconf.make` keys its object
+cache on the compiler and link flags but not on `C_SRCDIRS`, so without that
+check a stale C object can be relinked silently and every other row here stays
+green. It has caught this for real once.
 
 ```
 thread '<unnamed>' panicked at src/ffi.rs:858:5:
@@ -96,19 +101,20 @@ grep -rlniE 'pthread|thread|mutex' programs/*.c # threadpool.c, lz4io.c, lz4cli.
 ```
 
 `lib/` spawns no threads and holds no locks. Its only concurrency surface is a
-**contract**: `LZ4F_CDict` "can be created once and shared by multiple threads
+**contract**: `LZ4_CDict` "can be created once and shared by multiple threads
 concurrently, since its usage is read-only" (`lz4frame.h:596`), and every other
 API is caller-allocated with no global mutable state. Reproducing that contract
 means our port must have no hidden `static mut`, no lazily-initialised global
 table, no interior mutability behind a shared reference — which Rust enforces
 for us far more strictly than C did.
 
-This is not a gap dodged, and it is checked rather than asserted: the C CLI's
-threadpool drives our Rust library **multi-threaded** during `make test`
-(`Using 6 threads for compression` appears in the baseline run). Any global
-mutable state in the port would corrupt output or trip a data race there. So the
-concurrency claim is exercised end to end even though we ported no threading
-code — arguably better evidence than porting `threadpool.c` would have been.
+This is not a gap dodged, but be precise about its status: it is a claim we
+have **set up to be checked, not yet checked**. The C CLI's threadpool drives
+the library multi-threaded, so once functions exist, `make test` exercises our
+Rust concurrently and any hidden global mutable state would corrupt output or
+trip a race. The `Using 6 threads for compression` line quoted from the baseline
+run came from the **C** library, not from this port — no function is implemented
+yet. Re-state this section with real evidence once the suite runs green.
 
 That coverage is **not automatic** — it has to be wired deliberately, and
 getting it wrong yields shell tests that pass while testing the C library. See
@@ -154,8 +160,8 @@ nm --defined-only --extern-only lib/liblz4.a | awk '$2 ~ /^[TDBR]$/ {print $3}' 
 
 **141 symbols**: 51 core block codec, 32 high-compression, 39 frame/file, 19
 namespaced xxHash. `tools/gen_ffi.py` parses `lib/*.h`, generates the
-`extern "C"` skeleton, and cross-checks it against that list — it fails loudly
-if any exported symbol has no stub. Regenerate with `make gen-ffi`.
+`extern "C"` skeleton, and cross-checks it against that list — it exits
+non-zero if any exported symbol has no stub. Regenerate with `make gen-ffi`.
 
 ---
 
@@ -182,12 +188,22 @@ make -C tests test \
 * `C_SRCDIRS` drops `../lib` and substitutes `cstub/`, which holds five
   intentionally-empty translation units (`lz4.c`, `lz4hc.c`, `lz4frame.c`,
   `lz4file.c`, `xxhash.c`). The object names the makefile expects still get
-  produced; the C implementation is never compiled.
+  produced; no C implementation object is linked into any test binary.
 * `LDLIBS` is appended to every link line by `multiconf.make:222`, so our Rust
   archive resolves the symbols.
 
 **No file under `tests/` is modified.** Not the C sources, not the shell
 scripts, not `tests/Makefile`. This is wrapped up as `make test`.
+
+**One honest caveat.** `make test` includes `test-amalgamation`, whose rule
+(`tests/Makefile:207`) is `cat ../lib/lz4.c ../lib/lz4hc.c ../lib/lz4frame.c >
+lz4_all.c` and then compiles the result under `-std=c90 -Werror`. It names the
+paths literally, so `C_SRCDIRS` cannot redirect it, and the object is real: 116
+defined symbols. It is **never linked into anything** — it is upstream's
+standards-conformance check on its own sources — so no test binary contains C.
+But it means "no `lib/*.c` is ever compiled" would be false, and we do not say
+it. It also means one green test in the suite (`test-amalgamation`) would pass
+identically if this port did not exist.
 
 ### 4.1 The same trap, one level up: the CLI
 
@@ -236,8 +252,19 @@ and hand us a pointer — e.g. `LZ4_stream_t stream;` in `fuzzer.c`, and
    No `Box`, no `Vec`, no `String` in these structs — they must be
    initialisable in place through a raw pointer.
 2. The sizes **cannot be hardcoded**. `LZ4_STREAM_MINSIZE` is
-   `(1UL << LZ4_MEMORY_USAGE) + 32`, and `tests/Makefile:214-215` deliberately
-   rebuilds the suite with `LZ4_MEMORY_USAGE` at both its minimum and maximum.
+   `(1UL << LZ4_MEMORY_USAGE) + 32`, and upstream permits `LZ4_MEMORY_USAGE` to
+   range 10..20 (`lz4.h:162-164`), which moves the struct size by three orders
+   of magnitude.
+
+   *Scope correction:* an earlier revision claimed `tests/Makefile:214-215`
+   rebuilds the suite at both extremes. That target
+   (`test-compile-with-lz4-memory-usage`) only **compiles**, and is not a
+   prerequisite of `test:` — so `make test` never exercises either extreme.
+   Worse, nothing currently plumbs `LZ4_MEMORY_USAGE` from the C build into
+   cargo, so running that target with our overrides would leave the Rust side
+   at the probed 14 while C allocated a different size: silent stack
+   corruption, not a caught assert. Probing rather than hardcoding is still
+   right; the justification above is the honest one.
 
 So `build.rs` compiles and runs a small C probe against the real headers
 and emits the true numbers as Rust constants. At the default

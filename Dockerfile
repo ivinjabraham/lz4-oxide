@@ -8,7 +8,8 @@
 #    Build it once before relying on it. Tracked in PLAN.md §9.
 #
 # The image deliberately keeps a C toolchain. That is not the port leaning on
-# C -- no lib/*.c is ever compiled (see DECISIONS.md §4) -- it is because the
+# C -- no lib/*.c object is ever linked into a test binary (DECISIONS.md §4)
+# -- it is because the
 # *test suite* is C and must stay that way for the suite to be the original.
 
 FROM rust:1-bookworm

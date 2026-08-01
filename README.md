@@ -11,6 +11,10 @@ skipped. That is the whole proof strategy. See [DECISIONS.md](DECISIONS.md).
 Upstream pinned at [`0774d055`](https://github.com/lz4/lz4/commit/0774d05537f9762f838f7ab541b7765f1a729cb5)
 (`v1.9.2-1552-g0774d055`).
 
+> **Writing code?** Read [PORTING.md](PORTING.md) before you write a match
+> loop — it lists what breaks when translating *this* C into Rust, and two of
+> its warnings are things that pass every round-trip test while being wrong.
+>
 > **Working on this?** Start with [PLAN.md](PLAN.md) — current status, what's
 > left, who owns what, and the traps to avoid. The port is an early scaffold:
 > the test machinery is proven, but no library function is implemented yet.
@@ -45,7 +49,11 @@ make LZ4_SRC=/path/to/lz4 test
 | `make link-check` | Prove the original C tests *link* against the port |
 | `make test` | Run lz4's original test suite against the port |
 | `make test-reference` | Run the same suite against the untouched C library |
-| `make abi-check` | Diff our exported symbols against the original's |
+| `make test-quick` | `fuzzer` + `frametest` only — the edit/run loop |
+| `make abi-check` | Diff our exported symbols against the recorded original ABI |
+| `make provenance-check` | Prove each built test binary came from `cstub/`, not `lib/` |
+| `make kickoff-verify` | Prove the original tests are byte-identical to kickoff |
+| `make unsafe-count` | `unsafe` count and ratio; fails if any escapes `ffi.rs` |
 | `make gen-ffi` | Regenerate the FFI skeleton from the C headers |
 
 `make link-check` is the gate to clear first — see below.
@@ -105,10 +113,10 @@ own name rather than silently returning garbage.
 | 2 | Basic compress / decompress | most of `fuzzer` |
 | 3 | Frame format | `frametest` + all `test-lz4-*.sh` shell tests |
 | 4 | Streaming + dictionary | the rest of `fuzzer` |
-| 5 | High compression, levels 1–9 | `test-lz4hc` |
-| 6 | Optimal parser, levels 10–12 | hardest; cut this first if time runs short |
+| 5 | High compression, levels ≤2 and 3–9 | `test-lz4hc` |
+| 6 | Optimal parser, levels 10–12 | ~23% of `fuzzer` cycles — **not** the cheap cut it looks like (PLAN.md §6.1) |
 
-Steps 1–3 give a genuinely working lz4. Steps 4–6 buy score.
+Steps 2–3 give a genuinely working lz4. Steps 4–6 buy score.
 
 ### Who owns what
 

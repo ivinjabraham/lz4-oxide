@@ -74,7 +74,7 @@ knowing so nobody "simplifies" us into one:
 
 - shelling out to the original binary → we link a Rust staticlib
 - FFI-ing into the source language's runtime → C has none, and no `lib/*.c`
-  object is ever compiled (DECISIONS.md §4)
+  object is ever linked into a test binary (DECISIONS.md §4)
 - silently editing the original tests → `make kickoff-verify`
 - cherry-picking happy-path tests → the suite is run whole
 - repos over 8,000 source lines → 6,284 SLOC ported (DECISIONS.md §1)
@@ -338,7 +338,8 @@ where bugs live, and where the Bug Catcher prize is.
 | `make test` | Run lz4's original test suite against the port — **the score** |
 | `make test-quick` | `fuzzer` + `frametest` only — the edit/run loop |
 | `make test-reference` | Run the same suite against the untouched C library |
-| `make abi-check` | Diff our exported symbols against the original's |
+| `make abi-check` | Diff our exported symbols against the recorded original ABI |
+| `make provenance-check` | Prove each built test binary came from `cstub/`, not `lib/` |
 | `make kickoff-verify` | Prove the original tests are byte-identical to kickoff |
 | `make unsafe-count` | `unsafe` occurrences, ratio vs C SLOC; fails if any escapes `ffi.rs` |
 | `make gen-ffi` | ⚠️ Regenerate the FFI skeleton — **overwrites `src/ffi.rs`** |

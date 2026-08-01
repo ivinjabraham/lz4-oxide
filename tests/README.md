@@ -25,7 +25,7 @@ which asserts
 |---|---|
 | `KICKOFF.sha256` | SHA-256 of every tracked file in `upstream/tests/`, plus the pinned commit and its date |
 | `upstream/tests/` | the original suite itself (submodule, read-only by policy) |
-| `port/` | tests we added — not a substitute for the above |
+| `port/` | tests we add — **does not exist yet**; create it when we add any |
 
 `upstream/tests/cachedObjs/` is excluded from the manifest: it is build output,
 and is gitignored by upstream (`upstream/.gitignore:27`).
@@ -43,9 +43,9 @@ and is gitignored by upstream (`upstream/.gitignore:27`).
 | `make test-quick` | `fuzzer` + `frametest` only; the edit/run loop |
 | `make test-reference` | same full suite against the untouched C library — the baseline |
 
-`make test` and `make test-reference` both include `test-lz4-basic`, which
-generates 6GB and 3GB files. Budget tens of minutes and ~10GB of scratch space.
-Use `make test-quick` while implementing.
+`make test` and `make test-reference` both include huge-file cases that
+pipe `datagen -g6GB` and `-g3G` through the CLI (`test-lz4-fast-hugefile.sh`).
+Budget tens of minutes. Use `make test-quick` while implementing.
 
 ## The C baseline — our denominator
 
@@ -74,9 +74,16 @@ The suite is **100% green here for C**, so from this point every failure the
 Rust port shows is attributable to the port and not to the environment. Without
 that, hours go into debugging "failures" that were never ours.
 
-Reproduce with `make test-reference 2>&1 | tee bench/reference.log`. The raw log
-is ~1.9 MB of datagen progress bars and is gitignored; the numbers above are the
-part worth keeping.
+Reproduce with:
 
-*(Performance numbers are a different question and live in `bench/` — see
-DECISIONS.md deliverable 06. This section is about correctness only.)*
+```sh
+mkdir -p bench && make test-reference 2>&1 | tee bench/reference.log
+```
+
+The raw log is ~1.9 MB of datagen progress bars and is gitignored; the numbers
+above are the part worth keeping. Note `fuzzer` and `frametest` are **time**-
+bounded (`-T90s`, `tests/Makefile:55`), so the item counts scale with machine
+speed — the load-bearing figure is the exit code, not the totals.
+
+*(Performance numbers are a different question and will live in `bench/` — see
+PLAN.md §9, deliverable 06. This section is about correctness only.)*
