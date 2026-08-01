@@ -7,6 +7,35 @@ is checkable, the command that checks it is included.
 
 ---
 
+## 0. Verification status
+
+Last verified 2026-08-01 on x86_64-unknown-linux-gnu, rustc 1.97.1, gcc 16.1.1,
+against upstream lz4 pinned at `0774d055`.
+
+| Claim | Command | Result |
+|---|---|---|
+| Rust archive exports exactly the original ABI | `make abi-check` | **141/141, zero diff** |
+| Original C tests link against the port | `make link-check` | **pass** (`fuzzer`, `frametest`) |
+| The linked binaries really call Rust | `upstream/tests/fuzzer -i1` | **panics in `src/ffi.rs`** |
+| Upstream tree unmodified | `git -C upstream status --short` | **empty** |
+
+The third row is the one that matters. Linking proves only that symbol names
+resolved; it does not prove the C harness reaches Rust code. Running the
+resulting binary does — the original `fuzzer` aborts inside our
+`unimplemented!()` stub:
+
+```
+thread '<unnamed>' panicked at src/ffi.rs:858:5:
+not implemented: LZ4_versionString
+```
+
+That is lz4's own, unedited test program calling into this port.
+
+**Not yet true:** no function is implemented. Test *pass* rate is currently
+zero by construction. The skeleton is proven; the port is not written.
+
+---
+
 ## 1. Scope
 
 We port the **library** — `lib/` — and leave the command-line tool in C.
@@ -262,5 +291,5 @@ Recorded as we go; candidates for the Bug Catcher category.
 - [ ] Differential fuzz harness (C reference vs Rust, valid **and** malformed input)
 - [ ] Benchmark report: p99, RSS, startup, with methodology
 - [ ] Paste organisers' eligibility ruling (§2)
-- [ ] Confirm `LZ4F_compressOptions_t` / `LZ4F_decompressOptions_t` layouts
-      against the probe (currently transcribed from the header by hand)
+- [x] Confirm `LZ4F_compressOptions_t` / `LZ4F_decompressOptions_t` layouts
+      against the probe — done, both asserted in `src/types.rs` (§5)

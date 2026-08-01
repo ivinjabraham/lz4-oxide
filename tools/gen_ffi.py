@@ -220,7 +220,7 @@ def main():
         "// This is the linking skeleton: every name the original C test suite",
         "// asks for exists here, so `fuzzer`/`frametest` link. Bodies are filled",
         "// in module by module.",
-        "#![allow(non_snake_case, unused_variables, dead_code)]",
+        "#![allow(non_snake_case, unused_variables, dead_code, unused_imports)]",
         "",
         "use core::ffi::{c_char, c_double, c_float, c_int, c_long, c_longlong,",
         "                c_schar, c_short, c_uchar, c_uint, c_ulong, c_ulonglong,",

@@ -81,6 +81,13 @@ caller_allocated!(XXH64_state_t, XXH64_STATE_SIZE, XXH64_STATE_ALIGN, u64);
 pub type XXH32_hash_t = u32;
 pub type XXH64_hash_t = u64;
 
+/// `typedef enum { XXH_OK = 0, XXH_ERROR } XXH_errorcode;` -- a C enum, so
+/// `c_int` at the ABI boundary.
+pub type XXH_errorcode = c_int;
+
+pub const XXH_OK: XXH_errorcode = 0;
+pub const XXH_ERROR: XXH_errorcode = 1;
+
 #[repr(C)]
 pub struct XXH32_canonical_t {
     pub digest: [u8; 4],
@@ -96,6 +103,12 @@ pub struct XXH64_canonical_t {
 // ---------------------------------------------------------------------------
 
 pub type LZ4F_errorCode_t = usize;
+
+/// The error *enum*, distinct from `LZ4F_errorCode_t` above. Generated in C by
+/// the `LZ4F_LIST_ERRORS` X-macro (lib/lz4frame.h:698) as
+/// `typedef enum { LZ4F_OK_NoError = 0, ... } LZ4F_errorCodes;`, so `c_int`.
+/// Returned by `LZ4F_getErrorCode()`.
+pub type LZ4F_errorCodes = c_int;
 
 // C enums; all values are small non-negative ints, so `c_int` matches the ABI.
 pub type LZ4F_blockSizeID_t = c_int;

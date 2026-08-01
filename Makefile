@@ -35,10 +35,10 @@ RUST_LIB  := $(CURDIR)/target/$(PROFILE)/liblz4_rs.a
 CARGOFLAG := $(if $(filter release,$(PROFILE)),--release,)
 
 # Rust's staticlib needs libstd's own dependencies at the final link.
-# Do not trust this list -- get the authoritative one from the toolchain with:
-#   rustc --print native-static-libs --crate-type staticlib src/lib.rs
-# and paste its output here.
-RUST_LINK_DEPS ?= -lpthread -ldl -lm
+# Authoritative list, from (rustc 1.97.1, x86_64-unknown-linux-gnu):
+#   rustc --print native-static-libs --crate-type staticlib <any>.rs
+# Re-run that on a different host/toolchain before assuming it still holds.
+RUST_LINK_DEPS ?= -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc
 
 # tests/ and programs/ each set their own C_SRCDIRS, so the substitution is
 # per-directory: tests/ needs ../programs on the path (for lorem.o, bench.o),
