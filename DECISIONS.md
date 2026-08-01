@@ -69,10 +69,46 @@ done
 Both figures sit inside the 1,000–8,000 line eligibility window, so the port
 qualifies whether or not the vendored dependency is counted.
 
-**Why not the CLI.** `programs/` is another 6,982 lines, which would push the
-project past the ceiling. Leaving `lz4cli.c` / `lz4io.c` in C is also
-*positively* useful: the C CLI can be linked against our Rust library, so the
-`tests/test-lz4-*.sh` shell tests exercise the port end to end.
+**Why not the CLI.** `programs/` is another **4,511 SLOC** (`lz4io.c` 2,907 raw
+lines, `lz4cli.c` 896, `bench.c` 865, `threadpool.c` 430, plus support). Porting
+it too would put the project at 10,795 SLOC — past the 8,000 ceiling, which the
+organisers set precisely because larger entries do not finish.
+
+*(An earlier revision of this section said 6,982 lines. That was `programs/*.c`
+plus `*.h` counted raw, compared against a non-blank/non-comment figure for
+`lib/` — apples to oranges, and it flattered the argument. Both numbers here are
+now SLOC on the same basis. The conclusion is unchanged: still over the
+ceiling.)*
+
+Leaving `lz4cli.c` / `lz4io.c` in C is also *positively* useful: the C CLI links
+against our Rust library, so the `tests/test-lz4-*.sh` shell tests exercise the
+port end to end.
+
+### 1.1 Concurrency: there is none in `lib/`, and that is the point
+
+The organisers' framing calls out "same concurrency semantics." Worth stating
+plainly where concurrency actually lives in this codebase, because the answer
+shapes what we owe:
+
+```sh
+grep -rlniE 'pthread|thread|mutex' lib/*.c     # lz4frame.c — comments only
+grep -rlniE 'pthread|thread|mutex' programs/*.c # threadpool.c, lz4io.c, lz4cli.c, util.c
+```
+
+`lib/` spawns no threads and holds no locks. Its only concurrency surface is a
+**contract**: `LZ4F_CDict` "can be created once and shared by multiple threads
+concurrently, since its usage is read-only" (`lz4frame.h:596`), and every other
+API is caller-allocated with no global mutable state. Reproducing that contract
+means our port must have no hidden `static mut`, no lazily-initialised global
+table, no interior mutability behind a shared reference — which Rust enforces
+for us far more strictly than C did.
+
+This is not a gap dodged, and it is checked rather than asserted: the C CLI's
+threadpool drives our Rust library **multi-threaded** during `make test`
+(`Using 6 threads for compression` appears in the baseline run). Any global
+mutable state in the port would corrupt output or trip a data race there. So the
+concurrency claim is exercised end to end even though we ported no threading
+code — arguably better evidence than porting `threadpool.c` would have been.
 
 That coverage is **not automatic** — it has to be wired deliberately, and
 getting it wrong yields shell tests that pass while testing the C library. See

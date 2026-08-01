@@ -171,10 +171,37 @@ Ordered so each step unlocks the most tests per hour.
 | 2 | Basic compress / decompress | **A** | `src/block.rs` | most of `fuzzer` |
 | 3 | Frame format + checksums | **B** | `src/frame.rs`, `src/xxh.rs` | `frametest` + all `test-lz4-*.sh` |
 | 4 | Streaming + dictionary | **A** | `src/block.rs` | rest of `fuzzer` |
-| 5 | High compression, levels 1–9 | **C** | `src/hc.rs` | `test-lz4hc` |
-| 6 | Optimal parser, levels 10–12 | **C** | `src/hc.rs` | ⚠️ **cut this first if short on time** |
+| 5 | HC, levels ≤2 (`lz4mid`) and 3–9 (`lz4hc` hash chain) | **C** | `src/hc.rs` | `test-lz4hc` |
+| 6 | Optimal parser, levels 10–12 (`lz4opt`) | **C** | `src/hc.rs` | ~23% of `fuzzer` cycles — see below |
 
 Steps 2–3 give a genuinely working lz4. Steps 4–6 buy score.
+
+### 6.1 The optimal parser is not the cheap cut it looks like
+
+An earlier revision of this file marked step 6 "cut this first if short on
+time." **That was wrong**, and acting on it would have failed a lot of tests.
+
+`lz4hc.c:92-106` selects one of three strategies by level: `lz4mid` (≤2),
+`lz4hc` (3–9, `LZ4HC_compress_hashChain`), and `lz4opt` (10–12,
+`LZ4HC_compress_optimal`). The last is a dynamic-programming parser: instead of
+greedily taking the longest match, it prices each candidate in real output bytes
+via `LZ4HC_literalsPrice` / `LZ4HC_sequencePrice` (`lz4hc.c:1826-1848`),
+including the 255-extension bytes, and finds the cheapest parse over a 4096-byte
+window (`LZ4_OPT_NUM`).
+
+The reason it can't simply be dropped: `fuzzer.c:386` draws
+`compressionLevel = FUZ_rand(...) % (LZ4HC_CLEVEL_MAX+1)` **once per cycle** and
+then uses it across ~15 HC call sites on real data (`fuzzer.c:440-1043`).
+Levels 10–12 are 3 of 13 outcomes, so roughly **a quarter of all fuzzer cycles
+enter the optimal parser**. It is not a `test-lz4hc` side feature.
+
+**The actual fallback, if time runs out:** route levels 10–12 to the level-9
+hash chain rather than omitting them. That emits valid LZ4, so round-trip and
+CRC checks still pass and `fuzzer` stays green. What you lose is byte-identity
+with C — which costs behavioural equivalence (30% of score) and will show up in
+our own differential fuzzer as a divergence. Degrade, don't delete. And if you
+do this, say so in DECISIONS.md; an undocumented divergence is the thing the
+organisers explicitly penalise.
 
 **Person C also owns the fuzz harness, benchmarks and DECISIONS.md** — see §9.
 That is not a consolation prize; it is roughly a third of the total score, and
