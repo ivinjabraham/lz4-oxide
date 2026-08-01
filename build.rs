@@ -49,40 +49,37 @@ int main(void) {
     EMIT("LZ4F_DECOMPRESSOPTS", LZ4F_decompressOptions_t)
     printf("pub const LZ4_MEMORY_USAGE_PROBED: usize = %d;\n", LZ4_MEMORY_USAGE);
     printf("pub const LZ4_VERSION_NUMBER_PROBED: i32 = %d;\n", LZ4_VERSION_NUMBER);
+    /* LZ4_VERSION_STRING is "1.10.0" -- three macros glued and stringified by
+       the preprocessor, so it cannot be reconstructed from the header text
+       alone. Emitted NUL-terminated: LZ4_versionString() hands it to C. */
+    printf("pub const LZ4_VERSION_STRING_PROBED: &[u8] = b\"%s\\0\";\n", LZ4_VERSION_STRING);
     return 0;
 }
 "#;
 
 /// Locate the original lz4 C sources.
 ///
-/// This port lives in its own repository, so the upstream tree is external.
-/// Resolution order:
-///   1. `$LZ4_SRC` — set this to point anywhere.
-///   2. `upstream/` beside this file — where a git submodule would land.
-///   3. `../lz4` — a sibling checkout, the common local layout.
+/// Normally this is `upstream/`, the git submodule pinned at the commit the
+/// port is written against. `$LZ4_SRC` overrides it, but note that pointing
+/// elsewhere invalidates `make kickoff-verify` and `make abi-check`: both are
+/// claims about that specific commit.
 fn find_lz4_src(manifest_dir: &std::path::Path) -> PathBuf {
-    let candidates: Vec<PathBuf> = match std::env::var_os("LZ4_SRC") {
-        Some(p) => vec![PathBuf::from(p)],
-        None => vec![
-            manifest_dir.join("upstream"),
-            manifest_dir.parent().unwrap().join("lz4"),
-        ],
+    let candidate = match std::env::var_os("LZ4_SRC") {
+        Some(p) => PathBuf::from(p),
+        None => manifest_dir.join("upstream"),
     };
 
-    for c in &candidates {
-        if c.join("lib").join("lz4.h").is_file() {
-            return c.clone();
-        }
+    if candidate.join("lib").join("lz4.h").is_file() {
+        return candidate;
     }
 
+    // `upstream/` is a submodule, so a plain `git clone` leaves it empty.
     panic!(
-        "cannot find the lz4 C sources (looked for lib/lz4.h in: {}).\n\
-         Set LZ4_SRC to the lz4 checkout, e.g. LZ4_SRC=/path/to/lz4 cargo build",
-        candidates
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
+        "cannot find the lz4 C sources: no lib/lz4.h under {}.\n\
+         If you cloned without --recursive, populate the submodule:\n\
+         \x20   git submodule update --init --recursive\n\
+         Or point at an existing checkout: LZ4_SRC=/path/to/lz4 cargo build",
+        candidate.display()
     );
 }
 

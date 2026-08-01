@@ -14,10 +14,20 @@ to bottom once; it should take about five minutes.
 
 ## 1. Status at a glance
 
-> **No library function is implemented yet.** Test pass rate is **zero**, by
-> construction. What exists is a *proven scaffold*: the machinery that lets
-> lz4's own C test suite run against our Rust code. Do not mistake a green
-> `make link-check` for a working port.
+> **The scaffold is proven; the port is being written.** What exists for
+> certain is the machinery that lets lz4's own C test suite run against our
+> Rust code. Do not mistake a green `make link-check` for a working port.
+>
+> **Where the port stops right now is derivable — no doc to trust, and none to
+> update:**
+>
+> ```sh
+> stdbuf -oL ./upstream/tests/fuzzer -i1   # panics naming the next symbol to write
+> make test                                # the actual score
+> ```
+>
+> Deliberately no per-function checklist here: it would need an edit per commit
+> and would be wrong between them.
 
 | | State |
 |---|---|
@@ -27,7 +37,7 @@ to bottom once; it should take about five minutes.
 | C tests actually *call* Rust | ✅ proven |
 | Upstream tree unmodified | ✅ empty `git status` |
 | Struct layouts match C | ✅ probed + asserted at compile time |
-| **Any function implemented** | ❌ **none** |
+| **Library functions** | 🟡 in progress — see the commands above |
 | Differential fuzz harness | ❌ not started |
 | Benchmark report | ❌ not started |
 | Demo video | ❌ not started |
@@ -74,7 +84,7 @@ knowing so nobody "simplifies" us into one:
 
 - shelling out to the original binary → we link a Rust staticlib
 - FFI-ing into the source language's runtime → C has none, and no `lib/*.c`
-  object is ever linked into a test binary (DECISIONS.md §4)
+  object is ever linked into a test binary (DECISIONS.md §3)
 - silently editing the original tests → `make kickoff-verify`
 - cherry-picking happy-path tests → the suite is run whole
 - repos over 8,000 source lines → 6,284 SLOC ported (DECISIONS.md §1)
@@ -93,7 +103,7 @@ outputs is [DECISIONS.md §0](DECISIONS.md). The short version:
 ```sh
 make abi-check                 # 141/141, zero diff
 make link-check                # OK: original C tests link against the Rust port
-./upstream/tests/fuzzer -i1    # panics: not implemented: LZ4_versionString
+./upstream/tests/fuzzer -i1    # panics: not implemented: <next symbol to write>
 git -C upstream status --short # empty
 ```
 
@@ -119,7 +129,9 @@ make link-check
 Already have an lz4 checkout and don't want the submodule?
 `make LZ4_SRC=/path/to/lz4 link-check`.
 
-`LZ4_SRC` resolves: the `LZ4_SRC` variable → `./upstream` → `../lz4`.
+`LZ4_SRC` resolves: the `LZ4_SRC` variable, else `./upstream` (the submodule).
+Overriding it invalidates `kickoff-verify` and `abi-check` — both are claims
+about the pinned commit.
 
 ---
 
@@ -139,7 +151,7 @@ and redirect lz4's build to link ours instead of compiling its own C.
 
 The redirect is two ordinary make variables — `C_SRCDIRS` and `LDLIBS` — set on
 the command line. **No file under `upstream/` is edited.** Full mechanism in
-[DECISIONS.md §4](DECISIONS.md).
+[DECISIONS.md §3](DECISIONS.md).
 
 ---
 
@@ -273,11 +285,25 @@ Each of these costs hours if rediscovered the hard way.
 clears `MAKEFLAGS`, so our overrides don't reach the CLI sub-make. Both produce
 a green suite that exercises **C, not Rust**. Both are handled in our `Makefile`
 — don't "simplify" the `C_SRCDIRS`/`LDLIBS`/`-o lz4` machinery without reading
-[DECISIONS.md §4 and §4.1](DECISIONS.md). If you ever doubt it, run
+[DECISIONS.md §3 and §3.1](DECISIONS.md). If you ever doubt it, run
 `./upstream/tests/fuzzer -i1` and confirm it still dies in Rust.
 
 **Never edit anything under `upstream/`.** `git -C upstream status --short` must
 stay empty. That is the entire claim we make to judges.
+
+**A stale test binary will lie to you.** `upstream/tests/Makefile` lists the
+`.o` files as prerequisites of `fuzzer`, *not* our `liblz4_rs.a` — which reaches
+the link only through `LDLIBS`. So implementing a function and re-running
+`make link-check` can leave the old binary in place, panicking on the symbol you
+just wrote. It looks like your code did nothing. Force the relink:
+
+```sh
+rm -f "$(readlink -f upstream/tests/fuzzer)" upstream/tests/fuzzer
+```
+
+(The binaries are git-ignored, so this does not dirty `upstream/`.) Related:
+`panic = "abort"` discards buffered stdout, so the fuzzer's banner vanishes on
+panic — use `stdbuf -oL` when you need to *see* what the port returned.
 
 **Compressed output must be byte-identical to C** wherever the original is
 deterministic. Port the search loops faithfully — do not "improve" hash

@@ -5,11 +5,18 @@ Rust port of lz4's C library, ABI-compatible with liblz4, for a hackathon
 roadmap and task ownership. Rationale lives in [DECISIONS.md](DECISIONS.md);
 the porting traps and the byte-identity check are in [PORTING.md](PORTING.md).
 
-## State
+## The loop
 
-The scaffold is built and proven; **no library function is implemented yet**.
-Test pass rate is zero by construction. Work proceeds by running a test, reading
-the `not implemented: LZ4_xxx` panic, implementing that function, repeating.
+Run a test, read the `not implemented: LZ4_xxx` panic, implement that function,
+repeat. The next thing to write is whatever the panic names:
+
+```sh
+stdbuf -oL ./upstream/tests/fuzzer -i1
+```
+
+**Do not record which functions are done** — not here, not in PLAN.md. That is
+a doc edit per commit and it goes stale between them. The command above is the
+status; `make test` is the score.
 
 ## Rules
 

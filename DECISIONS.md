@@ -5,6 +5,12 @@ Port Mortem Hackathon 2026, Track A (C → Rust).
 Everything below records *why* the port is shaped the way it is. Where a claim
 is checkable, the command that checks it is included.
 
+Two parts, because they answer different questions. **Part I** is about the
+entry: what we chose to port, why the repository qualifies, and how lz4's own
+test suite runs against Rust without a single edit. **Part II** is about the
+code: the artefact's shape, the layouts it must match, and the policies that
+govern what goes inside it. §0 is the evidence table for both.
+
 ---
 
 ## 0. Verification status
@@ -48,6 +54,11 @@ port shows from here is attributable to the port. Without that baseline, hours
 get lost debugging "failures" that were never ours.
 
 ---
+
+# Part I — The entry: scope, eligibility, and the proof strategy
+
+What we took on, why it qualifies under the rules, and how the original test
+suite ends up testing Rust.
 
 ## 1. Scope
 
@@ -118,7 +129,7 @@ yet. Re-state this section with real evidence once the suite runs green.
 
 That coverage is **not automatic** — it has to be wired deliberately, and
 getting it wrong yields shell tests that pass while testing the C library. See
-§4.1.
+§3.1.
 
 ---
 
@@ -139,33 +150,7 @@ semantics, and its test suite. We did not read or depend on `lz4_flex`.
 
 ---
 
-## 3. Architecture: a Rust staticlib wearing liblz4's ABI
-
-The single most important constraint is that lz4's test suite is written in
-**C**. `tests/fuzzer.c`, `tests/frametest.c`, `tests/roundTripTest.c` and
-friends call the library directly. To run those tests unmodified, our Rust code
-has to be callable *as C*.
-
-So the crate builds as `crate-type = ["staticlib", "cdylib", "rlib"]`,
-producing `liblz4_rs.a`, and exports one `#[no_mangle] extern "C"` function per
-symbol the original archive exports.
-
-The symbol contract was taken from the real artefact rather than from the
-headers, so nothing is missed:
-
-```sh
-make -C lib liblz4.a
-nm --defined-only --extern-only lib/liblz4.a | awk '$2 ~ /^[TDBR]$/ {print $3}' | sort -u
-```
-
-**141 symbols**: 51 core block codec, 32 high-compression, 39 frame/file, 19
-namespaced xxHash. `tools/gen_ffi.py` parses `lib/*.h`, generates the
-`extern "C"` skeleton, and cross-checks it against that list — it exits
-non-zero if any exported symbol has no stub. Regenerate with `make gen-ffi`.
-
----
-
-## 4. Running the original test suite with zero edits to `tests/`
+## 3. Running the original test suite with zero edits to `tests/`
 
 This needed care, because the obvious approach silently does nothing.
 
@@ -205,7 +190,7 @@ But it means "no `lib/*.c` is ever compiled" would be false, and we do not say
 it. It also means one green test in the suite (`test-amalgamation`) would pass
 identically if this port did not exist.
 
-### 4.1 The same trap, one level up: the CLI
+### 3.1 The same trap, one level up: the CLI
 
 `tests/Makefile:68-71` builds the CLI via a sub-make:
 
@@ -230,7 +215,7 @@ A pleasant side effect: `multiconf.make` keys its object cache on a hash of the
 build flags, so the C reference build and the Rust build occupy different cache
 directories and can coexist. That is what the differential harness compares.
 
-### On "no source-language runtime linking"
+### 3.2 On "no source-language runtime linking"
 
 The rule forbids leaning on the *source language's runtime* (the cited example
 is Python→Rust calling the Python interpreter). C has no such runtime, and we
@@ -239,6 +224,37 @@ we are required to keep unmodified — plus the CLI, by choice (§1).
 
 Auditable claim: every `LZ4_*` / `LZ4F_*` symbol in the test binaries resolves
 into Rust, and no `lib/*.c` object participates in the link. `make abi-check` diffs the Rust archive's exports against the original's.
+
+---
+
+# Part II — Engineering decisions
+
+How the port is built: the shape of the artefact, the types it must match, and
+the policies (`unsafe`, error handling) that govern the code inside it.
+
+## 4. Architecture: a Rust staticlib wearing liblz4's ABI
+
+The single most important constraint is that lz4's test suite is written in
+**C**. `tests/fuzzer.c`, `tests/frametest.c`, `tests/roundTripTest.c` and
+friends call the library directly. To run those tests unmodified, our Rust code
+has to be callable *as C*.
+
+So the crate builds as `crate-type = ["staticlib", "cdylib", "rlib"]`,
+producing `liblz4_rs.a`, and exports one `#[no_mangle] extern "C"` function per
+symbol the original archive exports.
+
+The symbol contract was taken from the real artefact rather than from the
+headers, so nothing is missed:
+
+```sh
+make -C lib liblz4.a
+nm --defined-only --extern-only lib/liblz4.a | awk '$2 ~ /^[TDBR]$/ {print $3}' | sort -u
+```
+
+**141 symbols**: 51 core block codec, 32 high-compression, 39 frame/file, 19
+namespaced xxHash. `tools/gen_ffi.py` parses `lib/*.h`, generates the
+`extern "C"` skeleton, and cross-checks it against that list — it exits
+non-zero if any exported symbol has no stub. Regenerate with `make gen-ffi`.
 
 ---
 
@@ -434,7 +450,7 @@ Recorded as we go; candidates for the Bug Catcher category.
 - [ ] **Build the Dockerfile once.** It was written on a host without Docker,
       so it is unverified — an untested one-step build is worse than none.
 - [ ] Push to a public GitHub repo; correct the URL in `.port-mortem.toml`.
-- [ ] Fill in `unimplemented!()` stubs (see §3); order of work in `README.md`
+- [ ] Fill in `unimplemented!()` stubs (see §4); order of work in `PLAN.md` §6
 - [ ] Differential fuzz harness (C reference vs Rust, valid **and** malformed input)
 - [ ] Benchmark report: p99, RSS, startup, with methodology
 - [ ] Paste organisers' eligibility ruling (§2)

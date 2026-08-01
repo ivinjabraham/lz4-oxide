@@ -3,6 +3,7 @@ name = "lz4_rs"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
+authors = ["Ivin Joel Abraham", "Hridesh M. G.", "Abhinav M."]
 license = "BSD-2-Clause"
 description = "Rust port of the LZ4 compression library, ABI-compatible with liblz4"
 

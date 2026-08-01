@@ -10,23 +10,18 @@
 #   LDLIBS     multiconf.make:222 appends this to every link line, so our
 #              Rust staticlib satisfies the symbols the C tests reference.
 #
-# No file under tests/ is modified. See DECISIONS.md.
+# No file under tests/ is modified. See DECISIONS.md §3.
 
 # ---------------------------------------------------------------------------
 # Where are the original lz4 C sources?
 #
-# This port is its own repository, so upstream is external. Override with:
+# ./upstream, the submodule pinned at the commit this port is written against.
+# Matches build.rs. Override with:
 #   make LZ4_SRC=/path/to/lz4 test
-# Default order matches build.rs: a submodule at ./upstream, else a sibling
-# checkout at ../lz4.
+# but pointing elsewhere invalidates kickoff-verify and abi-check -- both are
+# claims about that specific commit.
 # ---------------------------------------------------------------------------
-ifeq ($(origin LZ4_SRC), undefined)
-  ifneq ($(wildcard $(CURDIR)/upstream/lib/lz4.h),)
-    LZ4_SRC := $(CURDIR)/upstream
-  else
-    LZ4_SRC := $(abspath $(CURDIR)/../lz4)
-  endif
-endif
+LZ4_SRC ?= $(CURDIR)/upstream
 export LZ4_SRC
 
 ROOT      := $(LZ4_SRC)
@@ -56,9 +51,11 @@ check-src:
 	  echo "ERROR: lz4 C sources not found at: $(ROOT)"; \
 	  echo "       (looked for \$$LZ4_SRC/lib/lz4.h)"; \
 	  echo; \
-	  echo "Point at your lz4 checkout, either way:"; \
+	  echo "upstream/ is a submodule -- a plain 'git clone' leaves it empty:"; \
+	  echo "  git submodule update --init --recursive"; \
+	  echo; \
+	  echo "Or point at an existing checkout:"; \
 	  echo "  make LZ4_SRC=/path/to/lz4 $(or $(MAKECMDGOALS),all)"; \
-	  echo "  git submodule add https://github.com/lz4/lz4 upstream"; \
 	  exit 1; }
 	@echo "using lz4 sources: $(ROOT)"
 
@@ -262,7 +259,7 @@ unsafe-count: check-src
 	 test -z "$$outside" \
 	   || { echo "FAIL: unsafe outside ffi.rs:"; echo "$$outside"; exit 1; }; \
 	 if [ "$$blocks" = 0 ]; then \
-	   echo "OK: no unsafe anywhere (every ffi.rs body is still unimplemented!())."; \
+	   echo "OK: no unsafe anywhere yet."; \
 	 else \
 	   echo "OK: all $$blocks unsafe occurrences are confined to src/ffi.rs."; \
 	 fi

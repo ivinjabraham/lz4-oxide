@@ -12,7 +12,7 @@
 //!              port is confined to `ffi` and is measurable for the write-up.
 //!
 //! Build produces `liblz4_rs.a`, which the *unmodified* original C test suite
-//! links in place of the C objects. See DECISIONS.md.
+//! links in place of the C objects. See DECISIONS.md §3.
 
 #![allow(non_camel_case_types, non_snake_case)]
 
@@ -27,4 +27,25 @@ pub mod xxh;
 pub mod ffi;
 
 /// LZ4 version this port targets, mirrored from the C headers at build time.
+///
+/// `LZ4_VERSION_NUMBER` is `MAJOR*100*100 + MINOR*100 + RELEASE`, folded to a
+/// constant by the C preprocessor; `build.rs` compiles that same expression
+/// against the real header rather than us retyping the result. Returned by
+/// `LZ4_versionNumber()`.
 pub const VERSION_NUMBER: i32 = types::LZ4_VERSION_NUMBER_PROBED;
+
+/// The same version as text, e.g. `b"1.10.0\0"`, returned by
+/// `LZ4_versionString()`.
+///
+/// C hands out a pointer to a string literal: static storage duration, valid
+/// for the life of the program, never freed by the caller. `&'static [u8]` is
+/// the exact equivalent, so `ffi` only has to pass on its address.
+///
+/// Kept NUL-terminated, because C reads a `const char*` until it finds one.
+/// Dropping the terminator would send the caller off the end of this static,
+/// so it is pinned at compile time in the same spirit as
+/// `types::assert_layout!`.
+pub const VERSION_STRING: &[u8] = types::LZ4_VERSION_STRING_PROBED;
+
+const _: () = assert!(VERSION_STRING.len() > 1);
+const _: () = assert!(VERSION_STRING[VERSION_STRING.len() - 1] == 0);

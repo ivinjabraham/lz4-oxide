@@ -11,13 +11,12 @@ skipped. That is the whole proof strategy. See [DECISIONS.md](DECISIONS.md).
 Upstream pinned at [`0774d055`](https://github.com/lz4/lz4/commit/0774d05537f9762f838f7ab541b7765f1a729cb5)
 (`v1.9.2-1552-g0774d055`).
 
-> **Writing code?** Read [PORTING.md](PORTING.md) before you write a match
-> loop — it lists what breaks when translating *this* C into Rust, and two of
-> its warnings are things that pass every round-trip test while being wrong.
->
-> **Working on this?** Start with [PLAN.md](PLAN.md) — current status, what's
-> left, who owns what, and the traps to avoid. The port is an early scaffold:
-> the test machinery is proven, but no library function is implemented yet.
+> **State:** a work in progress. The test machinery is proven — the original C
+> suite builds, links and runs against the Rust archive — and the library
+> functions are being filled in behind it, so expect failures until that is
+> done. `make test` is the honest answer at any moment.
+> [PLAN.md](PLAN.md) tracks what is left; [PORTING.md](PORTING.md) records what
+> breaks when translating *this* C into Rust.
 
 ---
 
@@ -32,14 +31,19 @@ cd lz4-oxide
 make test
 ```
 
-If you already have an lz4 checkout and don't want the submodule, point at it:
+The C sources come from `upstream/`, a submodule pinned at the commit above —
+hence `--recursive`. If you cloned without it, `git submodule update --init
+--recursive`.
+
+To build against an lz4 checkout you already have:
 
 ```sh
 make LZ4_SRC=/path/to/lz4 test
 ```
 
-`LZ4_SRC` resolves in this order: the `LZ4_SRC` variable, then `./upstream`
-(the submodule), then `../lz4` (a sibling checkout).
+`LZ4_SRC` overrides `upstream/` for both `make` and `build.rs`. Pointing it at a
+different tree invalidates `make kickoff-verify` and `make abi-check`, which are
+claims about the pinned commit specifically.
 
 ### Targets
 
@@ -76,7 +80,7 @@ as C:
 
 The one subtlety: lz4's tests don't link `liblz4.a` at all — they compile
 `lib/*.c` directly. We redirect that with two make variables (`C_SRCDIRS` and
-`LDLIBS`) rather than by editing anything. DECISIONS.md §4 explains it, and §4.1
+`LDLIBS`) rather than by editing anything. DECISIONS.md §3 explains it, and §3.1
 covers the same trap recurring in the CLI build.
 
 ### Layout
@@ -103,48 +107,28 @@ countable.
 
 ## Order of work
 
-Sequenced so each step unlocks the most tests. Each unimplemented function is
-`unimplemented!("LZ4_...")`, so anything not yet written fails loudly with its
-own name rather than silently returning garbage.
+Every unimplemented function is `unimplemented!("LZ4_...")`, so anything not yet
+written fails loudly with its own name rather than silently returning garbage.
+That makes the panic message the work queue.
 
-| # | Step | Unlocks |
-|---|---|---|
-| 1 | **Skeleton links** (`make link-check`) | the gate — nothing else counts until this passes |
-| 2 | Basic compress / decompress | most of `fuzzer` |
-| 3 | Frame format | `frametest` + all `test-lz4-*.sh` shell tests |
-| 4 | Streaming + dictionary | the rest of `fuzzer` |
-| 5 | High compression, levels ≤2 and 3–9 | `test-lz4hc` |
-| 6 | Optimal parser, levels 10–12 | ~23% of `fuzzer` cycles — **not** the cheap cut it looks like (PLAN.md §6.1) |
-
-Steps 2–3 give a genuinely working lz4. Steps 4–6 buy score.
-
-### Who owns what
-
-| | Area | Files |
-|---|---|---|
-| **A** | Block codec — steps 2 and 4 | `src/block.rs` |
-| **B** | Frame format + checksums — step 3 | `src/frame.rs`, `src/xxh.rs` |
-| **C** | High compression — steps 5/6 — **plus** the fuzz harness, benchmarks and DECISIONS.md | `src/hc.rs` |
-
-Role C is not a consolation prize. The differential fuzzer, the benchmark
-report and DECISIONS.md are worth roughly a third of the total score, and they
-are the classic thing teams leave until the last night.
+The sequenced breakdown — which step unlocks which tests, and why the optimal
+parser is not the cheap cut it looks like — is [PLAN.md §6](PLAN.md).
 
 ---
 
-## A note on behavioural equivalence
+## Behavioural equivalence
 
-Compressed output must match the C implementation **byte for byte** where the
-original is deterministic. So port the search loops faithfully — do not
-"improve" hash functions, tie-breaking, or table sizing, however tempting.
-Divergence there is invisible in round-trip tests and fatal in differential
-fuzzing.
+Compressed output matches the C implementation **byte for byte** wherever the
+original is deterministic: same hash functions, same tie-breaking, same table
+sizing. Divergence there is invisible to round-trip tests and shows up only
+under differential fuzzing, which is why the port follows the original's search
+loops rather than improving on them.
 
-For the decoder, the interesting property is not just that valid input
-round-trips, but that **malformed input is rejected identically**. Upstream's
-four most recent commits are all decode-bounds fixes, so that is where bugs
-live.
+For the decoder the property is stronger than "valid input round-trips":
+**malformed input must be rejected identically**. Upstream's four most recent
+commits are all decode-bounds fixes, so that is where bugs live.
 
 ## License
 
-BSD 2-Clause, matching upstream lz4.
+[BSD 2-Clause](LICENSE), matching upstream lz4's `lib/`. The port is a
+derivative work, so the original copyright notices are retained.
