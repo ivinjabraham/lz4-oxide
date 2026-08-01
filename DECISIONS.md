@@ -20,7 +20,7 @@ against upstream lz4 pinned at `0774d055`.
 | Upstream tree unmodified | `git -C upstream status --short` | **empty** |
 | Original test files match their kickoff hashes | `make kickoff-verify` | **42/42** |
 | `unsafe` confined to `src/ffi.rs` | `make unsafe-count` | **0 occurrences so far** |
-| C reference suite is green *on this host* | `make test-reference` | **exit 0** ([bench/baseline.md](bench/baseline.md)) |
+| C reference suite is green *on this host* | `make test-reference` | **exit 0** ([tests/README.md](tests/README.md#the-c-baseline--our-denominator)) |
 
 The third row is the one that matters. Linking proves only that symbol names
 resolved; it does not prove the C harness reaches Rust code. Running the

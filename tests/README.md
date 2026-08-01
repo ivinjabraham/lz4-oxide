@@ -46,3 +46,37 @@ and is gitignored by upstream (`upstream/.gitignore:27`).
 `make test` and `make test-reference` both include `test-lz4-basic`, which
 generates 6GB and 3GB files. Budget tens of minutes and ~10GB of scratch space.
 Use `make test-quick` while implementing.
+
+## The C baseline — our denominator
+
+Run before writing any implementation code, so that "N tests fail" means
+something. The original suite against the **untouched C library**, on the
+machine we develop on:
+
+| | |
+|---|---|
+| Date (UTC) | 2026-08-01 |
+| Host | x86_64-unknown-linux-gnu, Linux 7.1.5-arch1-1 |
+| Compiler | gcc (GCC) 16.1.1 20260728 |
+| lz4 commit | `0774d055` |
+| **Exit code** | **0 — full suite passed** |
+| Wall time | ~35 min, dominated by the 6GB/3GB cases |
+
+```
+9522 /   9522  - all tests completed successfully   (frametest)
+All tests completed                                 (fuzzer, 47840 items)
+All unit tests completed successfully compressionLevel=9
+All unit tests completed successfully compressionLevel=10
+Basic tests completed
+```
+
+The suite is **100% green here for C**, so from this point every failure the
+Rust port shows is attributable to the port and not to the environment. Without
+that, hours go into debugging "failures" that were never ours.
+
+Reproduce with `make test-reference 2>&1 | tee bench/reference.log`. The raw log
+is ~1.9 MB of datagen progress bars and is gitignored; the numbers above are the
+part worth keeping.
+
+*(Performance numbers are a different question and live in `bench/` — see
+DECISIONS.md deliverable 06. This section is about correctness only.)*
