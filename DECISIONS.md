@@ -18,6 +18,9 @@ against upstream lz4 pinned at `0774d055`.
 | Original C tests link against the port | `make link-check` | **pass** (`fuzzer`, `frametest`) |
 | The linked binaries really call Rust | `upstream/tests/fuzzer -i1` | **panics in `src/ffi.rs`** |
 | Upstream tree unmodified | `git -C upstream status --short` | **empty** |
+| Original test files match their kickoff hashes | `make kickoff-verify` | **42/42** |
+| `unsafe` confined to `src/ffi.rs` | `make unsafe-count` | **0 occurrences so far** |
+| C reference suite is green *on this host* | `make test-reference` | **exit 0** ([bench/baseline.md](bench/baseline.md)) |
 
 The third row is the one that matters. Linking proves only that symbol names
 resolved; it does not prove the C harness reaches Rust code. Running the
@@ -33,6 +36,11 @@ That is lz4's own, unedited test program calling into this port.
 
 **Not yet true:** no function is implemented. Test *pass* rate is currently
 zero by construction. The skeleton is proven; the port is not written.
+
+The last row is the **denominator**, and it is worth having before writing any
+code: the original suite passes 100% for C on this machine, so every failure the
+port shows from here is attributable to the port. Without that baseline, hours
+get lost debugging "failures" that were never ours.
 
 ---
 
@@ -234,11 +242,45 @@ Its history in this repo is 19 commits, almost all of the form "updated xxhash
 to latest version"; `lib/lz4.c` has 440. It is a dependency that happens to be
 checked in.
 
-**Decision: port it too, backed by the `xxhash-rust` crate.**
+**Decision: port it too, by hand, with no crate dependency.**
 
 We could have let the genuine C `xxhash.c` keep compiling (simply by omitting it
 from our stub directory). We chose not to: it would leave C objects in the
 shipped binaries and muddy the "no C implementation remains" claim.
+
+**Reversal (2026-08-01): we no longer use the `xxhash-rust` crate.** The first
+version of this section specified it. That is not implementable here, for the
+§5 reason: `XXH32_state_t` and `XXH64_state_t` are **fully specified in
+`lib/xxhash.h:264-285`** and the C tests declare them *on their own stack* —
+`XXH64_state_t xxh64;` at `frametest.c:1202`. The layout is therefore fixed by
+the C header:
+
+```c
+struct XXH32_state_s {          struct XXH64_state_s {
+   uint32_t total_len_32;          uint64_t total_len;
+   uint32_t large_len;             uint64_t v1, v2, v3, v4;
+   uint32_t v1, v2, v3, v4;        uint64_t mem64[4];
+   uint32_t mem32[4];              uint32_t memsize;
+   uint32_t memsize;               uint32_t reserved[2];
+   uint32_t reserved;           };  /* 88 bytes, align 8 */
+};  /* 48 bytes, align 4 */
+```
+
+No crate's private state type can match that, and `xxhash-rust` does not expose
+its internals, so we cannot even convert between the two at the boundary — the
+crate could only ever serve the one-shot `XXH32()`/`XXH64()` entry points, not
+the streaming ones. Splitting the two would mean *two* implementations of the
+same algorithm in one library, which is worse than either alone.
+
+So `src/xxh.rs` implements both hashes directly over a `repr(C)` state that
+mirrors the structs above. This is mechanical, spec-defined code (~250 lines);
+byte-exactness is not at risk, and it is covered by the `XXH32_canonical_*` /
+`XXH64_canonical_*` round-trips the suite already exercises.
+
+The crate does stay in the tree, as a **`[dev-dependencies]` test oracle**: unit
+tests hash the same buffers with both implementations, so ours is checked
+against a second implementation rather than only against itself. It is not
+linked into `liblz4_rs.a` — `cargo tree --edges normal` shows no dependencies.
 
 Scope note — the surface is larger than lz4 itself needs. LZ4's frame format
 only uses XXH32, but the **test harness** uses XXH64 heavily (~20 call sites in
@@ -259,8 +301,47 @@ propagate. Concretely:
 * `src/{block,hc,frame,file,xxh}.rs` — each carries
   `#![forbid(unsafe_code)]`. All real logic lives here, on slices.
 
-This keeps the unsafe surface small and, more importantly, *countable* for the
-benchmark/write-up.
+This keeps the unsafe surface small and, more importantly, *countable*:
+
+```sh
+make unsafe-count
+```
+
+reports the raw occurrence count, the ported C SLOC it is measured against, the
+ratio per 1000 C SLOC, and **fails the build if any `unsafe` appears outside
+`src/ffi.rs`**. That last part is the real control; the number is the evidence.
+Budget: `unsafe` is permitted only in `ffi.rs`, and there only for
+`slice::from_raw_parts{,_mut}` and in-place initialisation of caller-allocated
+state. Any other use is a decision that belongs in this file.
+
+### 7.1 Error handling: `Result` inside, C codes only at the boundary
+
+An explicit exit criterion is *"handles error paths idiomatically — `Result`,
+not errno translated"*. That is in genuine tension with an ABI-compatible port,
+because liblz4's callers — including the unmodified C tests — require the
+original integer conventions, and those conventions are not even uniform:
+`LZ4_compress_default` returns `0` on failure, `LZ4_decompress_safe` returns a
+*negative* value, and the frame API returns a `size_t` that must be fed to
+`LZ4F_isError`.
+
+We resolve it by **separating the two representations**, rather than picking one:
+
+* `src/{block,hc,frame,file,xxh}.rs` — the actual implementation — is written
+  in idiomatic Rust and returns `Result<_, Error>`, where `Error` is a real
+  enum (`MalformedInput`, `OutputTooSmall`, …). No integer sentinels, no
+  errno-style out-params, no `-1` propagating through internal call graphs.
+* `src/ffi.rs` translates, once, at the outermost frame: `Result` in, C
+  integer convention out — per function, because the conventions differ.
+
+So the error *logic* is idiomatic and the error *encoding* is compatible. The
+translation is the boundary's job, which is what a boundary is for. A judge
+reading `src/block.rs` should see Rust, not transliterated C; a judge running
+`tests/fuzzer` should see lz4's exact return values.
+
+The one thing this does **not** do is invent richer errors than the original
+reports. Where C collapses several failure modes into a single `0`, we still
+return `0` — behavioural equivalence outranks expressiveness at the boundary,
+and the differential fuzzer checks exactly that.
 
 ---
 
@@ -287,6 +368,9 @@ Recorded as we go; candidates for the Bug Catcher category.
 
 ## 9. Open items
 
+- [ ] **Build the Dockerfile once.** It was written on a host without Docker,
+      so it is unverified — an untested one-step build is worse than none.
+- [ ] Push to a public GitHub repo; correct the URL in `.port-mortem.toml`.
 - [ ] Fill in `unimplemented!()` stubs (see §3); order of work in `README.md`
 - [ ] Differential fuzz harness (C reference vs Rust, valid **and** malformed input)
 - [ ] Benchmark report: p99, RSS, startup, with methodology

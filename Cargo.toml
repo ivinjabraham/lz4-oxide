@@ -15,12 +15,19 @@ path = "src/lib.rs"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
-# XXH32 is required by the LZ4 frame format (block + content checksums);
-# XXH64 is used directly by the original test harness. See DECISIONS.md.
-xxhash-rust = { version = "0.8", features = ["xxh32", "xxh64"] }
+# None. xxHash is implemented in-tree (src/xxh.rs) rather than taken from a
+# crate: XXH32_state_t/XXH64_state_t are declared on the C test's stack, so
+# their layout is fixed by the C header and no crate's private state type can
+# match it. See DECISIONS.md §6.
 
 [build-dependencies]
 cc = "1.0"
+
+[dev-dependencies]
+# Not linked into the artifact -- an independent oracle for unit tests, so our
+# hand-written XXH32/XXH64 is checked against a second implementation rather
+# than only against itself.
+xxhash-rust = { version = "0.8", features = ["xxh32", "xxh64"] }
 
 [profile.release]
 opt-level = 3

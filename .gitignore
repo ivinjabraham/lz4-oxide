@@ -9,3 +9,8 @@
 
 __pycache__/
 *.pyc
+
+# Raw test-suite logs: megabytes of datagen progress bars. The distilled
+# results are committed (bench/baseline.md, bench/results.json, fuzz/log.txt).
+/bench/*.log
+

@@ -28,8 +28,57 @@ to bottom once; it should take about five minutes.
 | Differential fuzz harness | ❌ not started |
 | Benchmark report | ❌ not started |
 | Demo video | ❌ not started |
+| Kickoff hash manifest, `.port-mortem.toml` | ✅ done |
+| Dockerfile | 🟡 written, **never built** |
 
-Coding window closes **2026-08-03**. Judging runs to 2026-08-13.
+### The clock
+
+| | UTC |
+|---|---|
+| Kickoff | 2026-07-31 18:00 |
+| **Deadline** | **2026-08-03 18:00** |
+| Stop implementing, start packaging | **2026-08-03 08:00** |
+
+That third row is a decision, not a guess. The last ~10 hours go to the fuzz
+log, the benchmark run, the demo video and a DECISIONS.md pass. **The video
+cannot be made until tests actually pass live**, so it is hostage to everything
+else finishing — do not let it slide past the pivot.
+
+---
+
+## 1.1 The brief, condensed
+
+Port Mortem, Track A (C → Rust). The organisers' framing: *generating a port
+that compiles is now trivial; producing one that behaves like the original —
+same edge cases, same failure modes, original test suite untouched — is the
+open problem.* They cite the Bun rewrite editing the original tests as the
+anti-pattern.
+
+**Scoring: 40% functionality & reliability · 30% behavioural equivalence ·
+20% code quality · 10% innovation.**
+
+Exit criteria they named:
+
+| Criterion | Where we stand |
+|---|---|
+| Original C suite passes unmodified, ≥99% | ❌ 0% — the job |
+| `unsafe` under a *documented threshold* vs source line count | 🟡 policy + `make unsafe-count`; needs a stated budget |
+| ≥1 latent bug in the original found by differential fuzzing | ❌ harness not started |
+| Error paths idiomatic — `Result`, not translated errno | 🟡 architecture does this; see DECISIONS.md §7.1 |
+
+Automatic disqualifiers, all of which we avoid **by construction** — worth
+knowing so nobody "simplifies" us into one:
+
+- shelling out to the original binary → we link a Rust staticlib
+- FFI-ing into the source language's runtime → C has none, and no `lib/*.c`
+  object is ever compiled (DECISIONS.md §4)
+- silently editing the original tests → `make kickoff-verify`
+- cherry-picking happy-path tests → the suite is run whole
+- repos over 8,000 source lines → 6,284 SLOC ported (DECISIONS.md §1)
+
+Note the line ceiling is on **SLOC**: `lib/*.c` is 8,662 *raw* lines but 6,284
+non-blank non-comment. Both counts are in DECISIONS.md §1 so the arithmetic is
+visible rather than flattering.
 
 ---
 
@@ -219,14 +268,28 @@ is deliberately built with both extremes. Don't hardcode them.
 Scoring is 40% functionality / 30% behavioural equivalence / 20% code quality /
 10% innovation.
 
-| Deliverable | Owner | State |
-|---|---|---|
-| Working repo, one-command build | — | ✅ done |
-| Original test suite passing (≥99% target) | A, B, C | ❌ 0% — the main job |
-| Differential fuzz harness | **C** | ❌ not started |
-| DECISIONS.md | **C** | 🟡 written, needs the eligibility ruling pasted in (§2) |
-| Benchmark report (p99, RSS, startup + methodology) | **C** | ❌ not started |
-| 5-minute demo video | **C** | ❌ not started |
+The organisers ask for seven things. Mapped to this repo:
+
+| # | Deliverable | Where | Owner | State |
+|---|---|---|---|---|
+| 01 | Public GitHub repo with the port | — | — | 🟡 local only — **push it** |
+| 02 | One-step build to a runnable artifact | `make` / `Dockerfile` | — | 🟡 `make` works; Dockerfile never built |
+| 03 | Original suite, hashed at kickoff, passing | `tests/KICKOFF.sha256` | A, B, C | 🟡 hashed ✅ · passing ❌ 0% |
+| 04 | Differential fuzz harness | `fuzz/` | **C** | ❌ not started |
+| 05 | DECISIONS.md | `DECISIONS.md` | **C** | 🟡 written; needs eligibility ruling (§2) |
+| 06 | Benchmark report | `bench/` | **C** | ❌ not started |
+| 07 | 5-minute demo video | — | **C** | ❌ not started |
+
+Plus `.port-mortem.toml` (track letter, source URL, kickoff hash) — ✅ done,
+though the schema is our reading; conform it if a canonical one is published.
+
+**We brought our own repo**, so two things the pooled entrants get, we don't:
+a vetted line count (see §1.1) and the fuzz-harness template. The template is
+no real loss — a differential harness is ~100 lines. It generates random *and*
+malformed inputs, feeds the identical bytes to the C reference and to our port,
+and asserts they agree on output **and on rejection**: same error code for the
+same bad input, not merely agreement on valid data. Rejection parity is the
+half that finds bugs, and it is the half a naive harness omits.
 
 **Differential fuzzing note:** compare against the C reference built by
 `make test-reference`. Feed both **valid and malformed/truncated** input, and
@@ -242,9 +305,12 @@ where bugs live, and where the Bug Catcher prize is.
 |---|---|
 | `make` | Build `liblz4_rs.a` |
 | `make link-check` | Prove the original C tests link against the port |
-| `make test` | Run lz4's original test suite against the port |
+| `make test` | Run lz4's original test suite against the port — **the score** |
+| `make test-quick` | `fuzzer` + `frametest` only — the edit/run loop |
 | `make test-reference` | Run the same suite against the untouched C library |
 | `make abi-check` | Diff our exported symbols against the original's |
+| `make kickoff-verify` | Prove the original tests are byte-identical to kickoff |
+| `make unsafe-count` | `unsafe` occurrences, ratio vs C SLOC; fails if any escapes `ffi.rs` |
 | `make gen-ffi` | ⚠️ Regenerate the FFI skeleton — **overwrites `src/ffi.rs`** |
 | `make clean` | `cargo clean` + drop generated symbol lists |
 

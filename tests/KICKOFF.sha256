@@ -1,0 +1,54 @@
+# Port Mortem — original test suite, hashed at kickoff
+#
+# Source repo   : https://github.com/lz4/lz4
+# Pinned commit : 0774d05537f9762f838f7ab541b7765f1a729cb5
+# Commit date   : 2026-06-01T15:21:37-07:00
+# Kickoff       : 2026-07-31T18:00:00Z (pinned commit predates kickoff)
+# Manifest made : 2026-08-01T10:02:56Z
+#
+# Covers every git-tracked file under upstream/tests/ (42 files).
+# Build outputs (tests/cachedObjs/) are gitignored upstream and excluded.
+# Verify with: make kickoff-verify
+#
+5f54c855adf43cc6ca22aa31c5e07190d75d1d99e6eb7402d727f65f07bf61d4  tests/abiTest.c
+dc99d353ba1ca94cd7f90fbccda489f04c6c9d2f413132ad36e5e9c78f298dbf  tests/checkFrame.c
+e47a787d307711a2e1dd39bc04aa3ceeab0dbe5ec390e4b56891543706b6d0fb  tests/check_liblz4_version.sh
+3d4eed1552af93224c01dd506d93e845d2baf7e41083ba0dd55b59f5d64446a6  tests/check_stdvars.sh
+a49419f21d05aa45c7d82c7972064e1cd0d87ba6fe0a3417686337545d276445  tests/checkTag.c
+ea4d75bd3583ebde9ee015a733bc6aaf5a1650ddea514d0dde1cdc5dd50e75d5  tests/cmake/CMakeLists.txt
+609b910ef05c9c855ecc1da155a36ed0f57514eac452cf93446530b5ea4b3bc3  tests/COPYING
+78e3ace5a00312a60350687c915d6dd6c3626ecf2b4fecb6906c7cbec4600c91  tests/datagen.c
+0c6e833d6ac96c1eb2a220a3249f891dbaab3a6fa68bbaae0b2148562664db76  tests/datagencli.c
+49ff2d1b70db6329f3b5d28d2befa11060a42fddbdad84b9388c40521ea6e71f  tests/datagen.h
+1414d2a725042c8fef07faa38ff373b8fe96d49042fc1035b75ad07b59232d6c  tests/decompress-partial.c
+71a5c13989dd6a5d3bb25631c3de5fc45c2c0e813d4e9db36bf8b934632b6499  tests/decompress-partial-usingDict.c
+e1f1ca283c6e31e8c2586202b66819112dd962803d4b9dc8668a722f46daa2c1  tests/frametest.c
+ad5e6836cbff6fd38e04f20a21769c87216673f6912901b5e522ee4a97dbfd59  tests/freestanding.c
+ad763432325f2178cb729c840369c9df3bf1ca8a8c547cf75a28e50732eb2d06  tests/fullbench.c
+ebbaef9053306d9bf0fcd7efdb9e24e8cdfbbd98c05edd01222478420b241545  tests/fuzzer.c
+e110e5d3e03c7a491bda4f5aab73a69bdbd8774f9c053a5004c879f496575373  tests/.gitignore
+3fec2ac0604510a1327930b4450f2b48080d648a1d593d7b3b2072394275adc4  tests/goldenSamples/skip.bin
+fc958cac885b4a161f52e9be7d83f27c0ac481e71f78ad2074f7124c2b03576f  tests/loremOut.c
+a5fcb7823171e68f64e607a729ab47b44ad5c3488a86221de05301d692e68582  tests/loremOut.h
+e5c67c1ca968df632aacdbe0f3ed2a4fa83dd3be0fe6815afe8a3a9d4244455b  tests/Makefile
+5d54eb643e35a35c813034a5898643e527a371d72c699e68e46f74ce47cce1c1  tests/README.md
+1ed7d91a6d49751bfa6ade02ad56f738ca98b5c80516bf4314c7303781fc7126  tests/roundTripTest.c
+8466f9a3cf99bf29085ad6cbf8f28b3cae90ed2bf7acc456e4cd5ecdc7f91130  tests/test_custom_block_sizes.sh
+772b9013a80289806af837968afda5055531a5456e9ecba056ba82ec67a222d1  tests/test_install.sh
+aaf306f9902e293d4c756d9ef1de2bb68dd254312136b7e0f069a29d302d9bcd  tests/test-lz4-abi.py
+b8d7ba818315a8669c5996ed66c6b44d651fd9d23a5e0691efa9e5cc2ae6d528  tests/test-lz4-basic.sh
+6004277857d437379f858651fdc3debf0758c3c41168077da183aecc8604167a  tests/test-lz4-contentSize.sh
+919a0e319ba7f1db62b85e296aaec58660ef16003626e449c41635645fd96396  tests/test-lz4-dict.sh
+01b9924b5e2b4a0bcc56e28b7a677c750a21b27acb28715ac377f2fd6facdb4e  tests/test-lz4-fast-hugefile.sh
+4b9184b3fe9bba488a7bc2709f4555c3befc83412d453bad47bf5b5853d5f30d  tests/test-lz4-frame-concatenation.sh
+d91f4b3199377453b034e5ef7857abac0bbda0f4b566b797dac6a6ecc11bc165  tests/test-lz4hc-hugefile.sh
+a6694a172c54d3b6c8e871fff52fcbd22f2377c7f0e1d36da69c359e00e68963  tests/test-lz4-list.py
+ac081caecc1a6f807d9ff507fbaa678281c6cac78c9e7968c985ec76e41c6cd4  tests/test-lz4-multiple-legacy.sh
+3f70ecf7801f4fc9ba29cca094118ab907e387c01e0209bf7afeda6297298eaa  tests/test-lz4-multiple.sh
+7a8196f8753bf2572eb2665a149dc892894dc10461ad9b4f0ac1517c0d1f4d21  tests/test-lz4-opt-parser.sh
+cf65c010400f37147f7de8921328c80f48f6f98c00cfa6522f0c9b2089baf0f4  tests/test-lz4-skippable.sh
+7f790027646768ae8968ab78f13a8d187c71bce6d591f5f36758f4053da2b7b4  tests/test-lz4-sparse.sh
+1a4e6d0aa1e54c809cf69547dfbd7bca20d0792e5bf54b0651d279f271de5d1e  tests/test-lz4-speed.py
+dd4c1a0a2431b02fd4385e241f7115467b26f5d825fc3440c55133a5293f821b  tests/test-lz4-testmode.sh
+55bc0eae86cf1cd1200563bf236ffc49514c8d99493fef5d6562f772e5b219ac  tests/test-lz4-versions.py
+db8249c743951146f1b76746344a86bf08eec17c307700244a2f17340981ba69  tests/unicode_lint.sh

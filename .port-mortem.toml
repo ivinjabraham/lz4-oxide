@@ -1,0 +1,49 @@
+# Port Mortem 2026 — submission metadata.
+#
+# The organisers specified the fields (track letter, source URL, kickoff hash)
+# but not the exact schema; the key names below are our reading of it. If a
+# canonical schema is published, this file should be conformed to it — nothing
+# in the build reads it.
+
+track = "A"                    # C -> Rust
+
+[source]
+name       = "lz4"
+url        = "https://github.com/lz4/lz4"
+commit     = "0774d05537f9762f838f7ab541b7765f1a729cb5"
+commit_utc = "2026-06-01T22:21:37Z"   # predates kickoff (2026-07-31T18:00:00Z)
+language   = "C"
+license    = "BSD-2-Clause"
+
+# We brought our own repo rather than picking from the organisers' pool.
+# Scope: the library (lib/), not the CLI (programs/). Rationale in
+# DECISIONS.md §1.
+scope       = ["lib/lz4.c", "lib/lz4hc.c", "lib/lz4frame.c", "lib/lz4file.c", "lib/xxhash.c"]
+scope_sloc  = 6284             # non-blank, non-comment; `make unsafe-count` re-measures
+
+[port]
+language = "Rust"
+url      = "https://github.com/ivinjabraham/lz4-oxide"
+artifact = "target/release/liblz4_rs.a"   # staticlib exporting liblz4's 141 symbols
+
+[tests]
+# The original suite is consumed as a git submodule pinned at the commit above,
+# rather than vendored into tests/original/. It is therefore unmodified by
+# construction, and that is independently checkable two ways:
+#
+#   make kickoff-verify   -> submodule tree clean AND 42 files match kickoff hashes
+#
+manifest    = "tests/KICKOFF.sha256"
+manifest_utc = "2026-08-01T10:05:00Z"
+path        = "upstream/tests"
+file_count  = 42
+modified    = false
+
+[verify]
+build         = "make"
+one_step      = "docker build -t lz4-oxide ."
+test          = "make test"
+test_baseline = "make test-reference"
+abi           = "make abi-check"
+untouched     = "make kickoff-verify"
+unsafe        = "make unsafe-count"

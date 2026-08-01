@@ -123,9 +123,58 @@ link-check: $(RUST_LIB)
 	@echo "OK: original C tests link against the Rust port."
 
 # Reference build: the untouched C implementation, for differential comparison.
+#
+# NOTE: this is the FULL suite, which includes `test-lz4-basic`'s huge-file
+# cases (datagen -g6GB, -g3G). Expect tens of minutes and ~10GB of scratch.
+# For the edit/run loop use `make test-quick` instead.
 .PHONY: test-reference
 test-reference:
 	$(MAKE) -C $(ROOT)/tests test
+
+# The C-level tests only: fuzzer + frametest, no shell scripts, no huge files.
+# This is the loop to run while implementing; `make test` is the score.
+.PHONY: test-quick
+test-quick: $(RUST_LIB)
+	$(MAKE) -C $(ROOT)/tests test-fuzzer test-frametest $(TEST_OVERRIDES)
+
+# ---------------------------------------------------------------------------
+# Submission evidence
+# ---------------------------------------------------------------------------
+
+# The original test suite is untouched. Two independent checks: the submodule
+# has no working-tree diff, and every tracked file still hashes to what it
+# hashed at kickoff (tests/KICKOFF.sha256, recorded 2026-08-01).
+.PHONY: kickoff-verify
+kickoff-verify:
+	@test -z "$$(git -C $(ROOT) status --short)" \
+	  || { echo "FAIL: upstream working tree is dirty:"; \
+	       git -C $(ROOT) status --short; exit 1; }
+	@grep -v '^#' $(CURDIR)/tests/KICKOFF.sha256 \
+	  | (cd $(ROOT) && sha256sum --quiet -c -) \
+	  || { echo "FAIL: original test suite has been modified."; exit 1; }
+	@echo "OK: $$(grep -vc '^#' $(CURDIR)/tests/KICKOFF.sha256) test files match their kickoff hashes; upstream tree clean."
+
+# `unsafe` budget. The exit criterion asks for a documented threshold against
+# the source line count, so emit the number rather than just asserting a policy.
+# Ported C SLOC (non-blank, non-comment) is measured, not hardcoded.
+.PHONY: unsafe-count
+unsafe-count:
+	@code() { sed -e 's://.*::' -e '/unsafe_code/d' "$$@"; }; \
+	 blocks=$$(code $(CURDIR)/src/*.rs | grep -o '\bunsafe\b' | wc -l); \
+	 outside=$$(for f in $$(ls $(CURDIR)/src/*.rs | grep -v '/ffi\.rs$$'); do \
+	              code $$f | grep -q '\bunsafe\b' && echo $$f; \
+	            done); \
+	 csloc=$$(cat $(ROOT)/lib/lz4.c $(ROOT)/lib/lz4hc.c $(ROOT)/lib/lz4frame.c \
+	           $(ROOT)/lib/lz4file.c $(ROOT)/lib/xxhash.c \
+	          | grep -v '^\s*$$' | grep -v '^\s*[/*]' | wc -l); \
+	 rsloc=$$(cat $(CURDIR)/src/*.rs | grep -v '^\s*$$' | grep -v '^\s*//' | wc -l); \
+	 echo "unsafe occurrences : $$blocks"; \
+	 echo "C SLOC ported      : $$csloc"; \
+	 echo "Rust SLOC          : $$rsloc"; \
+	 echo "ratio              : $$(awk "BEGIN{printf \"%.2f\", $$blocks*1000/$$csloc}") unsafe per 1000 C SLOC"; \
+	 test -z "$$outside" \
+	   && echo "OK: unsafe confined to src/ffi.rs" \
+	   || { echo "FAIL: unsafe outside ffi.rs: $$outside"; exit 1; }
 
 # Confirm no C implementation leaked into the binary: every LZ4_* symbol the
 # tests resolve must come from the Rust archive.
