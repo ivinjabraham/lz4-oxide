@@ -11,6 +11,10 @@ skipped. That is the whole proof strategy. See [DECISIONS.md](DECISIONS.md).
 Upstream pinned at [`0774d055`](https://github.com/lz4/lz4/commit/0774d05537f9762f838f7ab541b7765f1a729cb5)
 (`v1.9.2-1552-g0774d055`).
 
+> **Working on this?** Start with [PLAN.md](PLAN.md) — current status, what's
+> left, who owns what, and the traps to avoid. The port is an early scaffold:
+> the test machinery is proven, but no library function is implemented yet.
+
 ---
 
 ## Build and test

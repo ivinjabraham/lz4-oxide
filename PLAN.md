@@ -1,0 +1,252 @@
+# lz4-oxide — working plan
+
+Team roadmap and handoff. If you are picking this up cold, read this file top
+to bottom once; it should take about five minutes.
+
+- **What & how to build** → [README.md](README.md)
+- **Why we made each call** (graded) → [DECISIONS.md](DECISIONS.md)
+- **Status, what's next, who does what** → this file
+
+---
+
+## 1. Status at a glance
+
+> **No library function is implemented yet.** Test pass rate is **zero**, by
+> construction. What exists is a *proven scaffold*: the machinery that lets
+> lz4's own C test suite run against our Rust code. Do not mistake a green
+> `make link-check` for a working port.
+
+| | State |
+|---|---|
+| Build system, one-command | ✅ done |
+| 141-symbol C ABI surface | ✅ generated, exact match |
+| Original C tests link against Rust | ✅ proven |
+| C tests actually *call* Rust | ✅ proven |
+| Upstream tree unmodified | ✅ empty `git status` |
+| Struct layouts match C | ✅ probed + asserted at compile time |
+| **Any function implemented** | ❌ **none** |
+| Differential fuzz harness | ❌ not started |
+| Benchmark report | ❌ not started |
+| Demo video | ❌ not started |
+
+Coding window closes **2026-08-03**. Judging runs to 2026-08-13.
+
+---
+
+## 2. Evidence
+
+Everything in §1 marked ✅ is checkable. The full table with commands and
+outputs is [DECISIONS.md §0](DECISIONS.md). The short version:
+
+```sh
+make abi-check                 # 141/141, zero diff
+make link-check                # OK: original C tests link against the Rust port
+./upstream/tests/fuzzer -i1    # panics: not implemented: LZ4_versionString
+git -C upstream status --short # empty
+```
+
+The third command is the one that matters. Linking only proves symbol *names*
+resolved. Running the binary proves the unmodified C harness reaches our Rust.
+
+---
+
+## 3. Setup from scratch
+
+```sh
+# 1. Rust toolchain
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"        # existing shells won't have it on PATH
+
+# 2. Clone WITH the submodule (upstream lz4, pinned at 0774d055)
+git clone --recursive <repo> lz4-oxide && cd lz4-oxide
+
+# 3. Prove it works
+make link-check
+```
+
+Already have an lz4 checkout and don't want the submodule?
+`make LZ4_SRC=/path/to/lz4 link-check`.
+
+`LZ4_SRC` resolves: the `LZ4_SRC` variable → `./upstream` → `../lz4`.
+
+---
+
+## 4. How the proof strategy works
+
+lz4's tests are **C programs**. For them to test Rust, the Rust must be callable
+as C. So we build a `staticlib` that exports the same 141 symbols as `liblz4.a`,
+and redirect lz4's build to link ours instead of compiling its own C.
+
+```
+   upstream/tests/fuzzer.c  ──calls──>  LZ4_compress_default(...)
+                                                │  resolved at link time by
+                                                ▼
+                                  target/release/liblz4_rs.a
+                                      (our extern "C" fns)
+```
+
+The redirect is two ordinary make variables — `C_SRCDIRS` and `LDLIBS` — set on
+the command line. **No file under `upstream/` is edited.** Full mechanism in
+[DECISIONS.md §4](DECISIONS.md).
+
+---
+
+## 5. The working loop
+
+This is why the skeleton was built before any real code: **the stubs are a
+self-generating worklist.**
+
+```
+  make link-check                    # build
+  ./upstream/tests/fuzzer -i1        # run
+    → "not implemented: LZ4_compressBound"
+  ...implement LZ4_compressBound...
+  repeat
+```
+
+Every unimplemented function is `unimplemented!("LZ4_xxx")`, so the test tells
+you its own name when it reaches it. You never have to guess what to do next.
+Work depth-first down whatever the panic says until the test gets further.
+
+Once functions start passing, `make test` gives you the real score.
+
+---
+
+## 6. Work breakdown
+
+Ordered so each step unlocks the most tests per hour.
+
+| # | Step | Owner | Files | Unlocks |
+|---|---|---|---|---|
+| 1 | Skeleton links | — | — | ✅ **done** |
+| 2 | Basic compress / decompress | **A** | `src/block.rs` | most of `fuzzer` |
+| 3 | Frame format + checksums | **B** | `src/frame.rs`, `src/xxh.rs` | `frametest` + all `test-lz4-*.sh` |
+| 4 | Streaming + dictionary | **A** | `src/block.rs` | rest of `fuzzer` |
+| 5 | High compression, levels 1–9 | **C** | `src/hc.rs` | `test-lz4hc` |
+| 6 | Optimal parser, levels 10–12 | **C** | `src/hc.rs` | ⚠️ **cut this first if short on time** |
+
+Steps 2–3 give a genuinely working lz4. Steps 4–6 buy score.
+
+**Person C also owns the fuzz harness, benchmarks and DECISIONS.md** — see §9.
+That is not a consolation prize; it is roughly a third of the total score, and
+it is the classic thing teams leave until the last night.
+
+---
+
+## 7. How to implement one function
+
+The pattern, every time: **`ffi.rs` converts raw pointers to slices immediately
+and delegates. All real logic lives in a safe module.**
+
+Generated stub:
+
+```rust
+#[no_mangle]
+pub extern "C" fn LZ4_compress_default(
+    src: *const c_char, dst: *mut c_char, srcSize: c_int, dstCapacity: c_int,
+) -> c_int {
+    unimplemented!("LZ4_compress_default")
+}
+```
+
+Implemented — `src/ffi.rs`:
+
+```rust
+#[no_mangle]
+pub unsafe extern "C" fn LZ4_compress_default(
+    src: *const c_char, dst: *mut c_char, srcSize: c_int, dstCapacity: c_int,
+) -> c_int {
+    if src.is_null() || dst.is_null() || srcSize < 0 || dstCapacity < 0 {
+        return 0;                       // C returns 0 on failure here
+    }
+    let input = unsafe { slice::from_raw_parts(src as *const u8, srcSize as usize) };
+    let output = unsafe { slice::from_raw_parts_mut(dst as *mut u8, dstCapacity as usize) };
+    crate::block::compress_default(input, output).unwrap_or(0) as c_int
+}
+```
+
+`src/block.rs` — no `unsafe` allowed here, the module has
+`#![forbid(unsafe_code)]`:
+
+```rust
+/// Returns the compressed length, or None if it doesn't fit in `dst`.
+pub fn compress_default(src: &[u8], dst: &mut [u8]) -> Option<usize> { ... }
+```
+
+Match the C return conventions exactly — they differ per function. Compression
+returns `0` on failure; `LZ4_decompress_safe` returns a **negative** value.
+Check the doc comment in `upstream/lib/lz4.h` for each one.
+
+### ⚠️ `make gen-ffi` overwrites `src/ffi.rs`
+
+It was a bootstrap tool. Once you start filling in bodies, **running it will
+destroy your work.** Only re-run it if the upstream ABI changes, and diff the
+result rather than accepting it wholesale.
+
+---
+
+## 8. Traps
+
+Each of these costs hours if rediscovered the hard way.
+
+**Tests that pass while testing nothing — twice.** lz4's tests don't link
+`liblz4.a`; they compile `lib/*.c` directly. And `upstream/tests/Makefile:68-71`
+clears `MAKEFLAGS`, so our overrides don't reach the CLI sub-make. Both produce
+a green suite that exercises **C, not Rust**. Both are handled in our `Makefile`
+— don't "simplify" the `C_SRCDIRS`/`LDLIBS`/`-o lz4` machinery without reading
+[DECISIONS.md §4 and §4.1](DECISIONS.md). If you ever doubt it, run
+`./upstream/tests/fuzzer -i1` and confirm it still dies in Rust.
+
+**Never edit anything under `upstream/`.** `git -C upstream status --short` must
+stay empty. That is the entire claim we make to judges.
+
+**Compressed output must be byte-identical to C** wherever the original is
+deterministic. Port the search loops faithfully — do not "improve" hash
+functions, tie-breaking, or table sizing. Divergence is invisible in round-trip
+tests and fatal in differential fuzzing (30% of the score).
+
+**Caller-allocated structs.** The C tests declare `LZ4_stream_t`,
+`XXH64_state_t` etc. *on their own stack* and hand us pointers. Our types must
+match C's size and alignment exactly — no `Box`, no `Vec`, no `String` in them.
+Sizes are probed from the real headers by `build.rs` and asserted at compile
+time, because `LZ4_STREAM_MINSIZE` varies with `LZ4_MEMORY_USAGE` and the suite
+is deliberately built with both extremes. Don't hardcode them.
+
+---
+
+## 9. Deliverables checklist
+
+Scoring is 40% functionality / 30% behavioural equivalence / 20% code quality /
+10% innovation.
+
+| Deliverable | Owner | State |
+|---|---|---|
+| Working repo, one-command build | — | ✅ done |
+| Original test suite passing (≥99% target) | A, B, C | ❌ 0% — the main job |
+| Differential fuzz harness | **C** | ❌ not started |
+| DECISIONS.md | **C** | 🟡 written, needs the eligibility ruling pasted in (§2) |
+| Benchmark report (p99, RSS, startup + methodology) | **C** | ❌ not started |
+| 5-minute demo video | **C** | ❌ not started |
+
+**Differential fuzzing note:** compare against the C reference built by
+`make test-reference`. Feed both **valid and malformed/truncated** input, and
+check they *reject* the same bytes — not just that they agree on valid data.
+Upstream's four most recent commits are all decode-bounds fixes, so that is
+where bugs live, and where the Bug Catcher prize is.
+
+---
+
+## 10. Commands
+
+| Command | What it does |
+|---|---|
+| `make` | Build `liblz4_rs.a` |
+| `make link-check` | Prove the original C tests link against the port |
+| `make test` | Run lz4's original test suite against the port |
+| `make test-reference` | Run the same suite against the untouched C library |
+| `make abi-check` | Diff our exported symbols against the original's |
+| `make gen-ffi` | ⚠️ Regenerate the FFI skeleton — **overwrites `src/ffi.rs`** |
+| `make clean` | `cargo clean` + drop generated symbol lists |
+
+Add `LZ4_SRC=/path/to/lz4` to any of them to use a checkout other than
+`./upstream`.
