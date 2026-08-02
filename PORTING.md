@@ -197,19 +197,55 @@ byte. C gets away with it because the caller guarantees slack in the buffer —
 that is what `MFLIMIT`, `LASTLITERALS` and `MATCH_SAFEGUARD_DISTANCE`
 (`lz4.c:246-248`) are reserving.
 
-In Rust a slice bound at the logical end will panic instead. **Do not
-reproduce the overcopy.** Write exactly the bytes that belong there:
+A slice bound at the logical end will panic instead, so the obvious move is to
+write exactly the bytes that belong there:
 
 ```rust
 out[pos..pos + len].copy_from_slice(&src[ip..ip + len]);   // literals: no overlap, this is fine
 ```
 
-The output is identical — the extra bytes C writes are always overwritten or
-discarded. What you *must* still port faithfully are the **limit constants and
-the comparisons against them**, because those affect which parsing decisions
-get made, and therefore the compressed bytes. Keep `MFLIMIT`, `LASTLITERALS`,
+That is correct, and it is where this port started. **It is also where roughly
+half of decompression's speed went** — a call into `memcpy` for the handful of
+bytes a typical sequence moves costs more than the copy. `LZ4_decompress_safe`
+ran at 0.21x of C on many-short-sequence data.
+
+You *can* reproduce the overcopy, and this port now does, in safe Rust. The
+slack is real: every wildcopy site in `safe_decode` is guarded so the overshoot
+lands inside the buffer (`cpy <= oend-MFLIMIT` with `MFLIMIT` 12 against a
+7-byte overshoot at `lz4.c:2350`; `oCopyLimit = oend-7` at `lz4.c:2444`). Write
+into `buf[op..op + 8]` where the guard proves those 8 bytes exist and nothing
+panics. See `copy_match_wild` and `Input::wild_copy_to` in `src/block.rs`, and
+DECISIONS.md §8.4.
+
+What you *must* port faithfully either way are the **limit constants and the
+comparisons against them**, because those affect which parsing decisions get
+made, and therefore the compressed bytes. Keep `MFLIMIT`, `LASTLITERALS`,
 `MINMATCH`, `WILDCOPYLENGTH` and every `ip < ilimit`-style guard exactly as
 written, even where the reason for a particular `-5` or `-12` is not obvious.
+
+> ⚠️ **Never write those guards with `saturating_sub`.** This is the trap that
+> makes the paragraph above dangerous, and it cost this port two crashes.
+>
+> C computes `oend - MFLIMIT`, `oend - 32`, `iend - 16` as **pointers**. On a
+> block shorter than the margin they land *before* the buffer, so `op <= oend-32`
+> is false and `cpy > oend-MFLIMIT` is true — either way the fast path is
+> unavailable and the careful path runs. `oend.saturating_sub(32)` clamps to
+> `0` instead, and for the first sequence of a block written at offset 0 both
+> comparisons flip the wrong way. The fast path then runs on a buffer far too
+> small for its margin.
+>
+> Write them **additively**, where nothing can underflow and the comparison is
+> exactly C's:
+>
+> ```rust
+> if op + 32 <= oend { /* shortcut */ }        // NOT: op <= oend.saturating_sub(32)
+> if cpy + MFLIMIT > oend { /* restricted */ } // NOT: cpy > oend.saturating_sub(MFLIMIT)
+> ```
+>
+> Only reachable with a tiny output buffer — `LZ4_decompress_safe_partial` with
+> a small `targetOutputSize`, or a small `dstCapacity`. Round-trip tests cannot
+> see it at all. `bench/verify.sh` sweeps capacities across the margin on
+> corrupt and truncated input and compares return codes; that is what found it.
 
 > ⚠️ **"It's only a fast path" is a claim to check, not to assume.** The
 > decoder's two-stage shortcut (`lz4.c:2241-2272`) looks like pure speed work
