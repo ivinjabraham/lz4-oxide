@@ -15,43 +15,66 @@ govern what goes inside it. §0 is the evidence table for both.
 
 ## 0. Verification status
 
-Last verified 2026-08-01 on x86_64-unknown-linux-gnu, rustc 1.97.1, gcc 16.1.1,
-against upstream lz4 pinned at `0774d055`.
+Last verified 2026-08-02 16:54 UTC on x86_64-unknown-linux-gnu,
+rustc 1.97.1 (8bab26f4f), gcc 16.1.1, against upstream lz4 pinned at `0774d055`.
 
 | Claim | Command | Result |
 |---|---|---|
+| **lz4's own suite passes against the port** | `make test` | **exit 0, end to end** |
+| No `unimplemented!()` remains | `grep unimplemented\! src/` | **0** |
 | Rust archive exports exactly the original ABI | `make abi-check` | **141/141, zero diff** |
-| Original C tests link against the port | `make link-check` | **pass** (`fuzzer`, `frametest`) |
-| The linked binaries really call Rust | `upstream/tests/fuzzer -i1` | **panics in `src/ffi.rs`** |
+| Original C tests link against the port | `make link-check` | **pass** |
+| No test binary contains a C implementation object | `make provenance-check` | **6/6 from `cstub/`** |
+| Block + frame codecs byte-identical to C, and reject identically | `bench/verify.sh` | **1261/1261** |
+| Frame codec + HC levels 1-2 byte-identical to C | `fuzz/driver.sh` | **26/26 identical** (§8.2) |
 | Upstream tree unmodified | `git -C upstream status --short` | **empty** |
 | Original test files match their kickoff hashes | `make kickoff-verify` | **42/42** |
-| `unsafe` confined to `src/ffi.rs` | `make unsafe-count` | **0 occurrences so far** |
-| Every built test binary came from `cstub/`, not `lib/` | `make provenance-check` | **pass** |
-| C reference suite is green *on this host* | `make test-reference` | **exit 0** ([tests/README.md](tests/README.md#the-c-baseline--our-denominator)) |
+| `unsafe` confined to `src/ffi.rs` | `make unsafe-count` | **307, all in `ffi.rs`** |
+| C reference suite is green *on this host* | `make test-reference` | **exit 0** (2026-08-01, [tests/README.md](tests/README.md#the-c-baseline--our-denominator)) |
 
-Two of those rows carry the weight. **Row 3** proves the C harness reaches Rust:
-linking only shows that symbol *names* resolved, whereas running the binary
-shows the original `fuzzer` aborting inside our `unimplemented!()` stub.
-**Row 5** proves the binary it ran was built from our stub directory rather than
-from a cached object compiled out of `lib/` — `multiconf.make` keys its object
-cache on the compiler and link flags but not on `C_SRCDIRS`, so without that
-check a stale C object can be relinked silently and every other row here stays
-green. It has caught this for real once.
+Three rows carry the weight, and they are not the obvious ones.
 
-```
-thread '<unnamed>' panicked at src/ffi.rs:858:5:
-not implemented: LZ4_versionString
-```
+**Row 1 is worth nothing without row 5.** lz4's tests do not link a prebuilt
+library — they compile `lib/*.c` themselves (§3). `multiconf.make` keys its
+object cache on the compiler and link flags but *not* on `C_SRCDIRS`, so a stale
+`lz4.o` built from the real `lib/lz4.c` can be relinked into a binary built with
+our overrides, with no duplicate-symbol error. `make test` then passes while
+testing C. `provenance-check` reads each binary's cached `.d` file, which records
+the path the compiler actually resolved through `vpath`, and fails if any came
+from `lib/`. It has caught this for real once. Together the two rows say: the
+suite passed, and the only implementation in those binaries was Rust.
 
-That is lz4's own, unedited test program calling into this port.
+**Row 6 covers what the suite structurally cannot.** Upstream's tests are
+round-trips and CRCs, so wrong-but-valid compressed output passes them, and so
+does an error returned at the wrong offset. `bench/verify.sh` compiles the
+`fuzz/` harnesses twice — against `upstream/lib/liblz4.a` and against
+`target/release/liblz4_rs.a` — and compares the bytes. It also sweeps decode
+capacities across the fast path's 32-byte margin on corrupt and truncated input
+and compares the *position-encoded return code*, so it checks that both
+implementations give up in the same place. That sweep is what found the two
+decoder bugs in §8.4, one of which made `make test` fail about one run in twelve;
+nothing else in the project could see either.
 
-**Not yet true:** no function is implemented. Test *pass* rate is currently
-zero by construction. The skeleton is proven; the port is not written.
+**What is still not true**, so that row 1 is not read as "done":
 
-The last row is the **denominator**, and it is worth having before writing any
-code: the original suite passes 100% for C on this machine, so every failure the
-port shows from here is attributable to the port. Without that baseline, hours
-get lost debugging "failures" that were never ours.
+* **HC levels 3-12 do not reproduce C's bytes** (§8.2). They round-trip and pass
+  every CRC in the suite, but a caller asking for level 9 gets level-2
+  compression. This is 11 of 13 reachable levels and the largest known gap in
+  behavioural equivalence.
+* **One `frametest` unit assertion fails** — `LZ4F_cctx_size` against
+  hook-counted allocation (§8.1). The randomized `fuzzerTests` that exercise the
+  format are green.
+* **A debug build cannot run the fuzzer.** It aborts almost immediately on a
+  `slice::from_raw_parts` precondition check at `src/ffi.rs:171`, a null
+  `prefixStart` on the lz4hc path. Release is unaffected, but `debug_assert!`s
+  and overflow checks are currently unreachable through the suite.
+* **Release builds lost one fail-loud property** in `common_bytes` (§8.4).
+
+The last table row is the **denominator**: the original suite passes 100% for C
+on this machine, so any failure the port shows is attributable to the port.
+Re-run it after any host or toolchain change, and note that it leaves C-linked
+binaries on the shared paths — run `make provenance-check` before trusting
+anything built afterwards.
 
 ---
 
@@ -392,9 +415,28 @@ make unsafe-count
 reports the raw occurrence count, the ported C SLOC it is measured against, the
 ratio per 1000 C SLOC, and **fails the build if any `unsafe` appears outside
 `src/ffi.rs`**. That last part is the real control; the number is the evidence.
-Budget: `unsafe` is permitted only in `ffi.rs`, and there only for
-`slice::from_raw_parts{,_mut}` and in-place initialisation of caller-allocated
-state. Any other use is a decision that belongs in this file.
+Budget: `unsafe` is permitted only in `ffi.rs`. The rule the build actually
+enforces is the *location*, not the count — `make unsafe-count` fails if a
+single occurrence appears anywhere else, and the number is evidence rather than
+a limit. As of 2026-08-02 it is **307 occurrences, 48.85 per 1000 ported C
+SLOC**, and it is dominated by the boundary being wide (141 exported functions,
+most of which convert two or three pointers) rather than by anything deep.
+
+The section above once said "only `slice::from_raw_parts{,_mut}` and in-place
+initialisation," and added that any other use is a decision belonging in this
+file. Four others exist, so here they are:
+
+| Construct | Why |
+|---|---|
+| `slice::from_raw_parts{,_mut}` (27) | The boundary conversion itself. |
+| `Box::into_raw` / `from_raw` (13) | Handles C owns and hands back: `LZ4F_CDict`, `LZ4_readFile_t`, `LZ4_writeFile_t`. The C API is create/free, which is exactly `Box`'s shape — the pointer is opaque to C and only ever returned to us. |
+| `core::mem::transmute` (3) | Only in `owned_new`/`owned_free`, turning `LZ4F_CustomMem`'s C function pointers into callable Rust ones. They arrive as raw `*mut c_void`-taking pointers and there is no safe cast for a fn-pointer type. |
+| `ptr::copy` (3) | Copying a decoded result into the caller's buffer where the destination is a bare pointer, not a slice we can own — including the `safeBuffer` staging in the ABI-compat path. |
+| `drop_in_place` / `addr_of` (3) | Dropping a value inside caller-allocated memory before the caller's own `free` reclaims the bytes (§8.1's `Owned<T>`). |
+
+None of these propagate: every one is confined to a single function whose
+callers see slices or `Result`. Adding a *fifth* kind is a decision, and belongs
+here.
 
 ### 7.1 Error handling: `Result` inside, C codes only at the boundary
 
@@ -779,9 +821,19 @@ where C merely reads a word past the match end, which is why it is still there.
 - [ ] **Build the Dockerfile once.** It was written on a host without Docker,
       so it is unverified — an untested one-step build is worse than none.
 - [ ] Push to a public GitHub repo; correct the URL in `.port-mortem.toml`.
-- [ ] Fill in `unimplemented!()` stubs (see §4); order of work in `PLAN.md` §6
+- [x] **Every exported symbol has a body — no `unimplemented!()` remains**, and
+      `make test` passes end to end (§0). The panic-driven loop that `PLAN.md`
+      §5 and `CLAUDE.md` describe is finished; both still tell a newcomer to run
+      `fuzzer -i1` and implement whatever it names, which now names nothing.
+- [ ] **Port the HC hash chain and optimal parser** (§8.2) — levels 3-12 are
+      routed to `lz4mid`, so 11 of 13 levels emit valid LZ4 that is not C's
+      bytes. The largest known behavioural-equivalence gap.
 - [ ] **Frame contexts: move the working buffers into the caller's allocator**
       (§8.1). One `frametest` unit assertion depends on it.
+- [ ] **Debug builds abort on a UB check** at `src/ffi.rs:171` —
+      `slice::from_raw_parts` on a null `prefixStart` in the lz4hc path, so the
+      fuzzer cannot run under `PROFILE=debug` and no `debug_assert!` or
+      overflow check is reachable through the suite. Release is unaffected.
 - [x] **Segfault in the prefix decode path — fixed (2026-08-02), see §8.3.**
       Killed decompressors #5/#6/#8 in `fullbench` and stopped `make test` at
       `test-fullbench`. `make test` now exits 0 end to end.
