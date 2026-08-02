@@ -630,6 +630,105 @@ drifts, so the return codes are in the transcript too.
 
 ---
 
+## 8.4 The block codec copies in bulk, and one of the two stated departures was wrong
+
+`src/block.rs` opens by recording two deliberate departures from the C. The
+first — **no wildcopy** — was justified on the grounds that `LZ4_wildCopy8`/`32`
+(lz4.c:466, :531) overwrite past the logical end of the data, and "in Rust that
+is a panic." **That premise is false**, and it cost real throughput.
+
+Every wildcopy call site in `safe_decode` is guarded so the overshoot lands
+*inside* the buffer: at lz4.c:2350 the guard is `cpy <= oend-MFLIMIT`, and
+`MFLIMIT` is 12 against a 7-byte overshoot; at lz4.c:2444 the copy stops at
+`oCopyLimit = oend-7`. C reserves the slack deliberately, and reading the guards
+rather than the comment above the function shows it. Overshooting was legal all
+along.
+
+What we ship now, and it is **still safe Rust** — `block.rs` keeps
+`#![forbid(unsafe_code)]` and `make unsafe-count` still reports every occurrence
+confined to `src/ffi.rs`:
+
+* `copy_match` — `copy_within` for disjoint regions; for an overlapping match,
+  one period materialised and then doubled. Each step reads only bytes an
+  earlier step finalised, so the pattern-repeat semantics that forbid a plain
+  `memmove` survive.
+* `copy_match_wild` / `Input::wild_copy_to` — fixed 8-byte steps that may write
+  up to 7 bytes past the run, used **only** where C's own guard proves the room.
+  `short_offset_prologue` ports the `inc32table`/`dec64table` trick
+  (lz4.c:2425), which repositions the source 8 bytes back so a sub-8 offset can
+  then be copied a word at a time. Its first four bytes stay sequential, because
+  below offset 4 each byte read there was written by the previous one — that
+  self-reference *is* the repeat the format encodes.
+* `common_bytes` — `LZ4_count`'s word compare plus a bit scan, with the scan
+  direction chosen by host endianness as `LZ4_NbCommonBytes` does.
+* `Input::as_slice` — the enum is matched once per scan, not once per byte.
+
+**`WILD_COPY_CUTOFF` is ours, not C's.** Below 32 bytes the fixed-width stores
+win, because calling `memcpy` for a handful of bytes costs more than the copy.
+Above it `memcpy` wins by a wide margin. C needs no such split: its wildcopy has
+no per-step bounds check to amortise. Removing the cutoff cost about a third of
+the decode throughput on literal-heavy input. The value is not sensitive —
+measured at 16/32/64/128/512, the spread sits inside the host's ~13%
+run-to-run noise.
+
+### What this measured, and what it ruled out
+
+`upstream/tests/fullbench`, built twice from the same `tests/Makefile` and
+confirmed by `make provenance-check` to link no `lib/*.c` object. 8 MB inputs,
+best-of-N, because single runs cannot resolve anything under ~13% here.
+`bench/bench.sh` and `bench/verify.sh` reproduce all of it.
+
+| vs C | `-P20` | `-P50` | `-P90` | 8 MB zeroes |
+|---|---|---|---|---|
+| `LZ4_decompress_safe`, before | 0.91x | 0.46x | 0.21x | — |
+| `LZ4_decompress_safe`, now | **0.97x** | **0.73x** | **0.48x** | **2.50x** |
+| `LZ4_decompress_safe_usingDict`, now | 0.97x | 0.66x | 0.56x | 2.55x |
+| `LZ4_compress_default`, now | 0.37x | 0.36x | 0.54x | 0.56x |
+
+The discriminating variable is **sequence density, not compressibility**.
+`datagen -P<n>` sets the probability of emitting a match rather than a literal
+run (`datagen.c:131`), so `-P90` means *many short* matches, not few long ones.
+Reading the P50→P90 drop as "long matches" is the natural mistake and it is
+wrong — C slows down on `-P90` too (7729 → 5664 MB/s), which it would not if the
+matches were getting longer. The cost was per-sequence: one call into `memcpy`
+per sequence. On 8 MB of zeroes, which really is one enormous match, we run
+**2.5x faster than C**, because C is still stepping 8 bytes at a time where the
+doubling loop hands whole megabytes to `memmove`.
+
+The second stated departure — **one decode loop**, i.e. no `LZ4_FAST_DEC_LOOP` —
+is **untested**. It is the one aimed squarely at `-P90`-shaped data, and it is
+the largest remaining decode lever. Treat it as an open question, not a settled
+decision, and note that the shortcut inside `safe_decode` is already documented
+as *not* behaviour-preserving, so assume the fast loop changes what is accepted
+until a rejection-parity run proves otherwise.
+
+Compression sits at 0.36x and the copies were never its bottleneck: the
+word-at-a-time `common_bytes` bought about 18% and that was most of what was
+available there. What remains is per-scanned-position cost in the match search —
+`hash_position` reads through `Input::window`, and `Table::get`/`put` dispatch on
+the `U16`/`U32` enum, on every position examined. C pays none of it, because
+`LZ4_FORCE_INLINE` instantiates the compressor per `dict_directive` and table
+type. Monomorphising ours the same way is the next lever, and it is a refactor
+rather than an algorithm change.
+
+### One regression in fail-loudness, recorded deliberately
+
+`common_bytes` clamps its length against both slices, so a caller that violates
+C's precondition gets a short count instead of an out-of-bounds index. The
+byte-at-a-time loop it replaced *panicked* in that situation. This is a real
+loss: the stale-`active_hist` bug fixed in §8.2's work drove the match index to
+~4.29e9, which the old loop reported as "index out of bounds" and this one turns
+into wrong output — `fuzzer -i60 -s9` still catches it at cycle 54, but by
+comparing output rather than by crashing.
+
+A `debug_assert!` restores the loud failure in debug builds (and debug catches
+this particular case earlier still, via the `u32` overflow check in
+`Hist::dict_at`). **In release the clamp remains, and that class of bug remains
+quiet.** Dropping the clamp would restore the panic at the cost of crashing
+where C merely reads a word past the match end, which is why it is still there.
+
+---
+
 ## 9. Open items
 
 - [ ] **Build the Dockerfile once.** It was written on a host without Docker,
@@ -644,7 +743,14 @@ drifts, so the return codes are in the transcript too.
 - [ ] Differential fuzz harness (C reference vs Rust, valid **and** malformed input)
       — `fuzz/hc_difftest.c` covers the HC surface (§8.2); the generic block and
       malformed-input halves are still missing
-- [ ] Benchmark report: p99, RSS, startup, with methodology
+- [ ] Benchmark report: p99, RSS, startup, with methodology — throughput vs C
+      is done and reproducible (§8.4, `bench/`); p99, RSS and startup are not
+- [ ] **Port `LZ4_FAST_DEC_LOOP`** (§8.4). The second of `block.rs`'s two stated
+      departures, still untested, and the largest remaining decode lever on
+      many-short-sequence data. Needs rejection parity, not just round-trips.
+- [ ] **Monomorphise the hot loops over `Input` / `DictDirective` / table type**
+      (§8.4). C gets this from `LZ4_FORCE_INLINE`; we dispatch at run time on
+      every scanned position, which is most of what keeps compression at 0.36x.
 - [ ] Paste organisers' eligibility ruling (§2)
 - [x] Confirm `LZ4F_compressOptions_t` / `LZ4F_decompressOptions_t` layouts
       against the probe — done, both asserted in `src/types.rs` (§5)
