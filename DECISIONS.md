@@ -448,12 +448,70 @@ Recorded as we go; candidates for the Bug Catcher category.
 
 ---
 
+## 8.1 Frame format: two documented divergences
+
+Both are in `src/frame.rs`, neither changes a compressed byte, and both are
+verified against the C library rather than asserted.
+
+**The custom allocator is honoured for the context, not for its buffers.**
+`LZ4F_create*_advanced` takes an `LZ4F_CustomMem` — the caller's own
+alloc/calloc/free. We route the *context struct* through those hooks
+(`Owned<T>` in `src/ffi.rs`), so a caller that supplies an arena gets its
+context from that arena and freed back to it. The working buffers inside the
+context (`tmpBuff`, `tmpIn`, `tmpOutBuffer`, the history) are still `Vec<u8>`,
+i.e. Rust's allocator.
+
+The visible consequence is exactly one assertion:
+`frametest.c:1095-1115` installs counting hooks and requires
+`LZ4F_cctx_size(cc) == live_alloc_total_space`. Our reported size counts the
+buffers; the hooks never saw them, so the numbers differ and `unitTests` fails
+there. Everything after that assertion in the same test — including the whole
+randomized `fuzzerTests` run, which is the part that exercises the format — is
+green:
+
+```sh
+./upstream/tests/frametest -i25 -t1    # All tests completed
+```
+
+Closing it properly means carving all five buffers out of one hook-allocated
+block and tracking them as offsets, which is what C does. That is a real change
+to how `Cctx`/`Dctx` address their memory, not a patch, so it is recorded here
+rather than half-done. **This is the one unit-test assertion the frame port does
+not satisfy.**
+
+**`LZ4F_updateDict` is collapsed.** C's version (lz4frame.c:1558) is a
+five-branch juggle over whether the decoder's history currently lives in the
+caller's `dst` or in `tmpOutBuffer`, and whether the two happen to be adjacent
+in memory — all of it to avoid a copy. We keep an owned 64 KB history and copy
+into it, which makes every branch the same branch. The decoded bytes cannot
+differ: only the history's *content* feeds the decoder, never its address. The
+cost is one memcpy per block.
+
+The same reasoning does **not** license simplifying the compression side, and
+we did not: `withPrefix64k` vs `usingExtDict` there changes which matches are
+found. Picking the wrong one cost 6 bytes per multi-block frame and was caught
+only by byte-comparison against C, never by a round trip — see the note in
+`Cctx::make_block`.
+
+### How byte-identity was checked
+
+`fuzz/framediff.c` compresses stdin as a frame and is compiled twice, against
+`upstream/lib/liblz4.a` and against `target/release/liblz4_rs.a`. Run over
+`datagen` output at 1 KB / 64 KB / 200 KB / 1 MB / 4 MB, each at `-P10/50/90`,
+across eight preference combinations (default, independent blocks, content
+checksum, block checksum, 256 KB and 4 MB block sizes, declared content size,
+and fast level -3): **120 comparisons, all byte-identical.**
+
+---
+
 ## 9. Open items
 
 - [ ] **Build the Dockerfile once.** It was written on a host without Docker,
       so it is unverified — an untested one-step build is worse than none.
 - [ ] Push to a public GitHub repo; correct the URL in `.port-mortem.toml`.
 - [ ] Fill in `unimplemented!()` stubs (see §4); order of work in `PLAN.md` §6
+- [ ] **Frame contexts: move the working buffers into the caller's allocator**
+      (§8.1). One `frametest` unit assertion depends on it.
 - [ ] Differential fuzz harness (C reference vs Rust, valid **and** malformed input)
 - [ ] Benchmark report: p99, RSS, startup, with methodology
 - [ ] Paste organisers' eligibility ruling (§2)

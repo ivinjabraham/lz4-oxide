@@ -171,6 +171,10 @@ assert_layout!(
 /// `LZ4F_createCompressionContext_advanced`. A by-value struct with the wrong
 /// layout corrupts silently instead of failing to link, so this one is
 /// asserted as carefully as the caller-allocated types.
+///
+/// `Copy` because C stores it by value too (`cctx->cmem = customMem`): four
+/// pointers with no ownership semantics of their own.
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct LZ4F_CustomMem {
     pub customAlloc: *mut c_void,

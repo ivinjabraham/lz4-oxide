@@ -85,238 +85,735 @@ fn decode_result(r: Result<usize, BlockError>) -> c_int {
     }
 }
 
-/// from lib/lz4frame.h
-#[no_mangle]
-pub extern "C" fn LZ4F_cctx_size(cctx: *const LZ4F_cctx) -> usize {
-    unimplemented!("LZ4F_cctx_size")
+
+// ===========================================================================
+// Frame format (lib/lz4frame.c)
+// ===========================================================================
+//
+// `LZ4F_cctx`/`LZ4F_dctx`/`LZ4F_CDict` are **opaque** to C: it only ever holds
+// pointers that came out of our own create functions, so unlike `LZ4_stream_t`
+// we choose the layout. Each is a `Box`ed Rust struct, and the handle C carries
+// is that `Box`'s raw pointer.
+//
+// Every entry point in this section returns `size_t`, where an error is
+// `(size_t)-(ptrdiff_t)code` — a huge unsigned number, never a negative one.
+// `frame::Error::to_code` is the single place that encoding is produced.
+
+use crate::frame::{self, BlockCompressMode, CDict, Cctx, Dctx, FrameInfo, Preferences};
+
+
+// --- Custom allocators -----------------------------------------------------
+//
+// `LZ4F_create*_advanced` takes an `LZ4F_CustomMem`: the caller's own
+// alloc/calloc/free. `frametest.c:1067-1121` does not merely pass these in, it
+// *audits* them — it tracks every live byte the hooks handed out and asserts
+// that `LZ4F_cctx_size`/`LZ4F_dctx_size` equal that total, before and after a
+// full frame round-trip. So the hooks cannot be accepted and ignored: the
+// contexts have to genuinely live in memory the caller allocated.
+//
+// The state therefore sits in a caller-provided block, with the size recorded
+// alongside it so `size_of` can report the same number the hooks recorded, and
+// `free` can be called on exactly the pointer that was handed out.
+
+/// A context living in caller-allocated memory.
+///
+/// `mem` is the `LZ4F_CustomMem` it came from, kept so that `free` uses the
+/// matching hook and opaque state — the test asserts on pointer identity, so
+/// releasing it through `libc::free` would trip its bookkeeping.
+struct Owned<T> {
+    /// The block the caller's allocator returned. This *is* the handle C holds.
+    block: *mut c_void,
+    /// Exactly what was requested from the hook, which is what the test counts.
+    size: usize,
+    mem: LZ4F_CustomMem,
+    value: T,
+}
+
+type AllocFn = unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void;
+type FreeFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
+
+/// Allocate `Owned<T>` through the caller's hooks, or the Rust allocator when
+/// none were supplied (C falls back to stdlib in exactly the same place).
+///
+/// # Safety
+/// `mem`'s function pointers, if non-null, have the signatures declared in
+/// `lz4frame.h:742-749`.
+unsafe fn owned_new<T>(mem: LZ4F_CustomMem, value: T) -> *mut Owned<T> {
+    let size = core::mem::size_of::<Owned<T>>();
+    let block: *mut c_void = if !mem.customCalloc.is_null() {
+        let f: AllocFn = unsafe { core::mem::transmute(mem.customCalloc) };
+        unsafe { f(mem.opaqueState, size) }
+    } else if !mem.customAlloc.is_null() {
+        let f: AllocFn = unsafe { core::mem::transmute(mem.customAlloc) };
+        unsafe { f(mem.opaqueState, size) }
+    } else {
+        // No hooks: a plain Box, whose pointer we then treat the same way.
+        let b = Box::new(Owned {
+            block: core::ptr::null_mut(),
+            size,
+            mem,
+            value,
+        });
+        let raw = Box::into_raw(b);
+        unsafe { (*raw).block = raw as *mut c_void };
+        return raw;
+    };
+    if block.is_null() {
+        return core::ptr::null_mut();
+    }
+    // The hook returned raw bytes; `Owned<T>` is not yet initialised there.
+    let raw = block as *mut Owned<T>;
+    unsafe {
+        raw.write(Owned {
+            block,
+            size,
+            mem,
+            value,
+        });
+    }
+    raw
+}
+
+/// Release an `Owned<T>` through whichever route allocated it.
+///
+/// # Safety
+/// `raw` came from `owned_new` and is not used again.
+unsafe fn owned_free<T>(raw: *mut Owned<T>) {
+    if raw.is_null() {
+        return;
+    }
+    let mem = unsafe { (*raw).mem };
+    let block = unsafe { (*raw).block };
+    if mem.customFree.is_null() && mem.customAlloc.is_null() && mem.customCalloc.is_null() {
+        drop(unsafe { Box::from_raw(raw) });
+        return;
+    }
+    // Drop the Rust value in place, then hand the bytes back to the caller.
+    unsafe { core::ptr::drop_in_place(&mut (*raw).value) };
+    if !mem.customFree.is_null() {
+        let f: FreeFn = unsafe { core::mem::transmute(mem.customFree) };
+        unsafe { f(mem.opaqueState, block) };
+    }
+}
+
+/// The zero `LZ4F_CustomMem` — C's `LZ4F_defaultCMem` (lz4frame.h:755), which
+/// means "use stdlib".
+fn default_cmem() -> LZ4F_CustomMem {
+    LZ4F_CustomMem {
+        customAlloc: core::ptr::null_mut(),
+        customCalloc: core::ptr::null_mut(),
+        customFree: core::ptr::null_mut(),
+        opaqueState: core::ptr::null_mut(),
+    }
+}
+
+/// Turn a `Result` into the `LZ4F_*` return convention.
+#[inline]
+fn f_result(r: frame::Res<usize>) -> usize {
+    match r {
+        Ok(n) => n,
+        Err(e) => e.to_code(),
+    }
+}
+
+/// Read `LZ4F_preferences_t` into the plain-data mirror. `None` maps to C's
+/// "NULL means all defaults".
+///
+/// # Safety
+/// `p` is either null or a valid `LZ4F_preferences_t`.
+unsafe fn read_prefs(p: *const LZ4F_preferences_t) -> Option<Preferences> {
+    if p.is_null() {
+        return None;
+    }
+    let c = unsafe { &*p };
+    Some(Preferences {
+        frame_info: FrameInfo {
+            block_size_id: c.frameInfo.blockSizeID,
+            block_mode: c.frameInfo.blockMode,
+            content_checksum: c.frameInfo.contentChecksumFlag != 0,
+            frame_type: c.frameInfo.frameType,
+            content_size: c.frameInfo.contentSize as u64,
+            dict_id: c.frameInfo.dictID as u32,
+            block_checksum: c.frameInfo.blockChecksumFlag != 0,
+        },
+        compression_level: c.compressionLevel,
+        auto_flush: c.autoFlush != 0,
+        favor_dec_speed: c.favorDecSpeed != 0,
+    })
+}
+
+/// Write the plain-data mirror back into a caller-provided `LZ4F_frameInfo_t`.
+///
+/// # Safety
+/// `out` is a valid, writable `LZ4F_frameInfo_t`.
+unsafe fn write_frame_info(out: *mut LZ4F_frameInfo_t, fi: &FrameInfo) {
+    unsafe {
+        (*out).blockSizeID = fi.block_size_id;
+        (*out).blockMode = fi.block_mode;
+        (*out).contentChecksumFlag = c_int::from(fi.content_checksum);
+        (*out).frameType = fi.frame_type;
+        (*out).contentSize = fi.content_size as c_ulonglong;
+        (*out).dictID = fi.dict_id as c_uint;
+        (*out).blockChecksumFlag = c_int::from(fi.block_checksum);
+    }
+}
+
+/// A `*mut c_void` + length as a slice, tolerating C's null-with-zero-length.
+///
+/// # Safety
+/// `p` is either null or valid for `len` bytes.
+#[inline]
+unsafe fn opt_slice<'a>(p: *const c_void, len: usize) -> &'a [u8] {
+    if p.is_null() || len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(p as *const u8, len) }
+    }
+}
+
+/// # Safety
+/// `p` is either null or valid and writable for `len` bytes.
+#[inline]
+unsafe fn opt_slice_mut<'a>(p: *mut c_void, len: usize) -> &'a mut [u8] {
+    if p.is_null() || len == 0 {
+        &mut []
+    } else {
+        unsafe { slice::from_raw_parts_mut(p as *mut u8, len) }
+    }
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_compressBegin(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, prefsPtr: *const LZ4F_preferences_t) -> usize {
-    unimplemented!("LZ4F_compressBegin")
+pub unsafe extern "C" fn LZ4F_cctx_size(cctx: *const LZ4F_cctx) -> usize {
+    if cctx.is_null() {
+        return 0;
+    }
+    // Exactly what the caller's allocator recorded. C adds `maxBufferSize`
+    // because its working buffers also come from the hooks; ours are Rust Vecs
+    // on the Rust heap, so counting them here would claim bytes the caller's
+    // allocator never saw — frametest.c:1110 asserts the two totals are equal.
+    let o = unsafe { &*(cctx as *const Owned<Cctx>) };
+    o.size
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_compressBegin_usingCDict(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, cdict: *const LZ4F_CDict, prefsPtr: *const LZ4F_preferences_t) -> usize {
-    unimplemented!("LZ4F_compressBegin_usingCDict")
+pub unsafe extern "C" fn LZ4F_compressBegin(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, prefsPtr: *const LZ4F_preferences_t) -> usize {
+    LZ4F_compressBegin_usingDict(cctx, dstBuffer, dstCapacity, core::ptr::null(), 0, prefsPtr)
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_compressBegin_usingDict(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, dictBuffer: *const c_void, dictSize: usize, prefsPtr: *const LZ4F_preferences_t) -> usize {
-    unimplemented!("LZ4F_compressBegin_usingDict")
+pub unsafe extern "C" fn LZ4F_compressBegin_usingCDict(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, cdict: *const LZ4F_CDict, prefsPtr: *const LZ4F_preferences_t) -> usize {
+    if cctx.is_null() {
+        return frame::Error::ParameterNull.to_code();
+    }
+    let c = unsafe { &mut (*(cctx as *mut Owned<Cctx>)).value };
+    let dst = unsafe { opt_slice_mut(dstBuffer, dstCapacity) };
+    let prefs = unsafe { read_prefs(prefsPtr) };
+    let cd = if cdict.is_null() {
+        None
+    } else {
+        Some(unsafe { &*(cdict as *const CDict) })
+    };
+    f_result(c.begin(dst, None, cd, prefs.as_ref()))
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_compressBound(srcSize: usize, prefsPtr: *const LZ4F_preferences_t) -> usize {
-    unimplemented!("LZ4F_compressBound")
+pub unsafe extern "C" fn LZ4F_compressBegin_usingDict(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, dictBuffer: *const c_void, dictSize: usize, prefsPtr: *const LZ4F_preferences_t) -> usize {
+    if cctx.is_null() {
+        return frame::Error::ParameterNull.to_code();
+    }
+    let c = unsafe { &mut (*(cctx as *mut Owned<Cctx>)).value };
+    let dst = unsafe { opt_slice_mut(dstBuffer, dstCapacity) };
+    let prefs = unsafe { read_prefs(prefsPtr) };
+    let dict = if dictBuffer.is_null() || dictSize == 0 {
+        None
+    } else {
+        Some(unsafe { opt_slice(dictBuffer, dictSize) })
+    };
+    f_result(c.begin(dst, dict, None, prefs.as_ref()))
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_compressEnd(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, cOptPtr: *const LZ4F_compressOptions_t) -> usize {
-    unimplemented!("LZ4F_compressEnd")
+pub unsafe extern "C" fn LZ4F_compressBound(srcSize: usize, prefsPtr: *const LZ4F_preferences_t) -> usize {
+    let prefs = unsafe { read_prefs(prefsPtr) };
+    frame::compress_bound(srcSize, prefs.as_ref())
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_compressFrame(dstBuffer: *mut c_void, dstCapacity: usize, srcBuffer: *const c_void, srcSize: usize, preferencesPtr: *const LZ4F_preferences_t) -> usize {
-    unimplemented!("LZ4F_compressFrame")
+pub unsafe extern "C" fn LZ4F_compressEnd(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, cOptPtr: *const LZ4F_compressOptions_t) -> usize {
+    if cctx.is_null() {
+        return frame::Error::ParameterNull.to_code();
+    }
+    let c = unsafe { &mut (*(cctx as *mut Owned<Cctx>)).value };
+    let dst = unsafe { opt_slice_mut(dstBuffer, dstCapacity) };
+    f_result(c.end(dst))
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_compressFrameBound(srcSize: usize, preferencesPtr: *const LZ4F_preferences_t) -> usize {
-    unimplemented!("LZ4F_compressFrameBound")
+pub unsafe extern "C" fn LZ4F_compressFrame(dstBuffer: *mut c_void, dstCapacity: usize, srcBuffer: *const c_void, srcSize: usize, preferencesPtr: *const LZ4F_preferences_t) -> usize {
+    // C uses a stack context here to avoid an allocation (lz4frame.c:496); ours
+    // is a short-lived Box, which is the same lifetime with a different home.
+    let mut cctx = Cctx::new();
+    let dst = unsafe { opt_slice_mut(dstBuffer, dstCapacity) };
+    let src = unsafe { opt_slice(srcBuffer, srcSize) };
+    let prefs = unsafe { read_prefs(preferencesPtr) };
+    f_result(frame::compress_frame(&mut cctx, dst, src, None, prefs.as_ref()))
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_compressFrame_usingCDict(cctx: *mut LZ4F_cctx, dst: *mut c_void, dstCapacity: usize, src: *const c_void, srcSize: usize, cdict: *const LZ4F_CDict, preferencesPtr: *const LZ4F_preferences_t) -> usize {
-    unimplemented!("LZ4F_compressFrame_usingCDict")
+pub unsafe extern "C" fn LZ4F_compressFrameBound(srcSize: usize, preferencesPtr: *const LZ4F_preferences_t) -> usize {
+    let prefs = unsafe { read_prefs(preferencesPtr) };
+    frame::compress_frame_bound(srcSize, prefs.as_ref())
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_compressUpdate(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, srcBuffer: *const c_void, srcSize: usize, cOptPtr: *const LZ4F_compressOptions_t) -> usize {
-    unimplemented!("LZ4F_compressUpdate")
+pub unsafe extern "C" fn LZ4F_compressFrame_usingCDict(cctx: *mut LZ4F_cctx, dst: *mut c_void, dstCapacity: usize, src: *const c_void, srcSize: usize, cdict: *const LZ4F_CDict, preferencesPtr: *const LZ4F_preferences_t) -> usize {
+    if cctx.is_null() {
+        return frame::Error::ParameterNull.to_code();
+    }
+    let c = unsafe { &mut (*(cctx as *mut Owned<Cctx>)).value };
+    let dst = unsafe { opt_slice_mut(dst, dstCapacity) };
+    let source = unsafe { opt_slice(src, srcSize) };
+    let prefs = unsafe { read_prefs(preferencesPtr) };
+    let cd = if cdict.is_null() {
+        None
+    } else {
+        Some(unsafe { &*(cdict as *const CDict) })
+    };
+    f_result(frame::compress_frame(c, dst, source, cd, prefs.as_ref()))
+}
+
+/// from lib/lz4frame.h
+#[no_mangle]
+pub unsafe extern "C" fn LZ4F_compressUpdate(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, srcBuffer: *const c_void, srcSize: usize, cOptPtr: *const LZ4F_compressOptions_t) -> usize {
+    if cctx.is_null() {
+        return frame::Error::ParameterNull.to_code();
+    }
+    let c = unsafe { &mut (*(cctx as *mut Owned<Cctx>)).value };
+    let dst = unsafe { opt_slice_mut(dstBuffer, dstCapacity) };
+    let src = unsafe { opt_slice(srcBuffer, srcSize) };
+    f_result(c.update(dst, src, BlockCompressMode::Compressed))
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
 pub extern "C" fn LZ4F_compressionLevel_max() -> c_int {
-    unimplemented!("LZ4F_compressionLevel_max")
+    frame::LZ4HC_CLEVEL_MAX as c_int
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_createCDict(dictBuffer: *const c_void, dictSize: usize) -> *mut LZ4F_CDict {
-    unimplemented!("LZ4F_createCDict")
+pub unsafe extern "C" fn LZ4F_createCDict(dictBuffer: *const c_void, dictSize: usize) -> *mut LZ4F_CDict {
+    LZ4F_createCDict_advanced(
+        LZ4F_CustomMem {
+            customAlloc: core::ptr::null_mut(),
+            customCalloc: core::ptr::null_mut(),
+            customFree: core::ptr::null_mut(),
+            opaqueState: core::ptr::null_mut(),
+        },
+        dictBuffer,
+        dictSize,
+    )
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_createCDict_advanced(customMem: LZ4F_CustomMem, dictBuffer: *const c_void, dictSize: usize) -> *mut LZ4F_CDict {
-    unimplemented!("LZ4F_createCDict_advanced")
+pub unsafe extern "C" fn LZ4F_createCDict_advanced(customMem: LZ4F_CustomMem, dictBuffer: *const c_void, dictSize: usize) -> *mut LZ4F_CDict {
+    if dictBuffer.is_null() {
+        return core::ptr::null_mut();
+    }
+    let d = unsafe { opt_slice(dictBuffer, dictSize) };
+    Box::into_raw(Box::new(CDict::new(d))) as *mut LZ4F_CDict
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_createCompressionContext(cctxPtr: *mut *mut LZ4F_cctx, version: c_uint) -> LZ4F_errorCode_t {
-    unimplemented!("LZ4F_createCompressionContext")
+pub unsafe extern "C" fn LZ4F_createCompressionContext(cctxPtr: *mut *mut LZ4F_cctx, version: c_uint) -> LZ4F_errorCode_t {
+    if cctxPtr.is_null() {
+        return frame::Error::ParameterNull.to_code();
+    }
+    let p = LZ4F_createCompressionContext_advanced(default_cmem(), version);
+    unsafe { *cctxPtr = p };
+    if p.is_null() {
+        return frame::Error::AllocationFailed.to_code();
+    }
+    0
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_createCompressionContext_advanced(customMem: LZ4F_CustomMem, version: c_uint) -> *mut LZ4F_cctx {
-    unimplemented!("LZ4F_createCompressionContext_advanced")
+pub unsafe extern "C" fn LZ4F_createCompressionContext_advanced(customMem: LZ4F_CustomMem, version: c_uint) -> *mut LZ4F_cctx {
+    let mut c = Cctx::new();
+    c.version = version as u32;
+    unsafe { owned_new(customMem, c) as *mut LZ4F_cctx }
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_createDecompressionContext(dctxPtr: *mut *mut LZ4F_dctx, version: c_uint) -> LZ4F_errorCode_t {
-    unimplemented!("LZ4F_createDecompressionContext")
+pub unsafe extern "C" fn LZ4F_createDecompressionContext(dctxPtr: *mut *mut LZ4F_dctx, version: c_uint) -> LZ4F_errorCode_t {
+    if dctxPtr.is_null() {
+        return frame::Error::ParameterNull.to_code();
+    }
+    let p = LZ4F_createDecompressionContext_advanced(default_cmem(), version);
+    unsafe { *dctxPtr = p };
+    if p.is_null() {
+        return frame::Error::AllocationFailed.to_code();
+    }
+    0
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_createDecompressionContext_advanced(customMem: LZ4F_CustomMem, version: c_uint) -> *mut LZ4F_dctx {
-    unimplemented!("LZ4F_createDecompressionContext_advanced")
+pub unsafe extern "C" fn LZ4F_createDecompressionContext_advanced(customMem: LZ4F_CustomMem, version: c_uint) -> *mut LZ4F_dctx {
+    let mut d = Dctx::new();
+    d.version = version as u32;
+    unsafe { owned_new(customMem, d) as *mut LZ4F_dctx }
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_dctx_size(dctx: *const LZ4F_dctx) -> usize {
-    unimplemented!("LZ4F_dctx_size")
+pub unsafe extern "C" fn LZ4F_dctx_size(dctx: *const LZ4F_dctx) -> usize {
+    if dctx.is_null() {
+        return 0;
+    }
+    // Same reasoning as `LZ4F_cctx_size`: report only hook-allocated bytes.
+    let o = unsafe { &*(dctx as *const Owned<Dctx>) };
+    o.size
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_decompress(dctx: *mut LZ4F_dctx, dstBuffer: *mut c_void, dstSizePtr: *mut usize, srcBuffer: *const c_void, srcSizePtr: *mut usize, dOptPtr: *const LZ4F_decompressOptions_t) -> usize {
-    unimplemented!("LZ4F_decompress")
+pub unsafe extern "C" fn LZ4F_decompress(dctx: *mut LZ4F_dctx, dstBuffer: *mut c_void, dstSizePtr: *mut usize, srcBuffer: *const c_void, srcSizePtr: *mut usize, dOptPtr: *const LZ4F_decompressOptions_t) -> usize {
+    LZ4F_decompress_usingDict(
+        dctx, dstBuffer, dstSizePtr, srcBuffer, srcSizePtr,
+        core::ptr::null(), 0, dOptPtr,
+    )
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_decompress_usingDict(dctxPtr: *mut LZ4F_dctx, dstBuffer: *mut c_void, dstSizePtr: *mut usize, srcBuffer: *const c_void, srcSizePtr: *mut usize, dict: *const c_void, dictSize: usize, decompressOptionsPtr: *const LZ4F_decompressOptions_t) -> usize {
-    unimplemented!("LZ4F_decompress_usingDict")
+pub unsafe extern "C" fn LZ4F_decompress_usingDict(dctxPtr: *mut LZ4F_dctx, dstBuffer: *mut c_void, dstSizePtr: *mut usize, srcBuffer: *const c_void, srcSizePtr: *mut usize, dict: *const c_void, dictSize: usize, decompressOptionsPtr: *const LZ4F_decompressOptions_t) -> usize {
+    if dctxPtr.is_null() || dstSizePtr.is_null() || srcSizePtr.is_null() {
+        return frame::Error::ParameterNull.to_code();
+    }
+    let d = unsafe { &mut (*(dctxPtr as *mut Owned<Dctx>)).value };
+    let dst_cap = unsafe { *dstSizePtr };
+    let src_len = unsafe { *srcSizePtr };
+    let dst = unsafe { opt_slice_mut(dstBuffer, dst_cap) };
+    let src = unsafe { opt_slice(srcBuffer, src_len) };
+    let dict = if dict.is_null() || dictSize == 0 {
+        None
+    } else {
+        Some(unsafe { opt_slice(dict, dictSize) })
+    };
+    let skip = if decompressOptionsPtr.is_null() {
+        false
+    } else {
+        unsafe { (*decompressOptionsPtr).skipChecksums != 0 }
+    };
+
+    // Both counts are reported even on failure, and C zeroes them first, so a
+    // caller that ignores the error still sees a consistent pair.
+    unsafe {
+        *dstSizePtr = 0;
+        *srcSizePtr = 0;
+    }
+    match frame::decompress(d, dst, src, dict, skip) {
+        Ok(p) => {
+            unsafe {
+                *dstSizePtr = p.dst_written;
+                *srcSizePtr = p.src_consumed;
+            }
+            p.hint
+        }
+        Err(e) => e.to_code(),
+    }
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_flush(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, cOptPtr: *const LZ4F_compressOptions_t) -> usize {
-    unimplemented!("LZ4F_flush")
+pub unsafe extern "C" fn LZ4F_flush(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, cOptPtr: *const LZ4F_compressOptions_t) -> usize {
+    if cctx.is_null() {
+        return frame::Error::ParameterNull.to_code();
+    }
+    let c = unsafe { &mut (*(cctx as *mut Owned<Cctx>)).value };
+    let dst = unsafe { opt_slice_mut(dstBuffer, dstCapacity) };
+    f_result(c.flush(dst))
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_freeCDict(CDict: *mut LZ4F_CDict) {
-    unimplemented!("LZ4F_freeCDict")
+pub unsafe extern "C" fn LZ4F_freeCDict(CDict: *mut LZ4F_CDict) {
+    if !CDict.is_null() {
+        drop(unsafe { Box::from_raw(CDict as *mut CDict) });
+    }
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_freeCompressionContext(cctx: *mut LZ4F_cctx) -> LZ4F_errorCode_t {
-    unimplemented!("LZ4F_freeCompressionContext")
+pub unsafe extern "C" fn LZ4F_freeCompressionContext(cctx: *mut LZ4F_cctx) -> LZ4F_errorCode_t {
+    // Accepts NULL, like free().
+    unsafe { owned_free(cctx as *mut Owned<Cctx>) };
+    0
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_freeDecompressionContext(dctx: *mut LZ4F_dctx) -> LZ4F_errorCode_t {
-    unimplemented!("LZ4F_freeDecompressionContext")
+pub unsafe extern "C" fn LZ4F_freeDecompressionContext(dctx: *mut LZ4F_dctx) -> LZ4F_errorCode_t {
+    // The return value is the stage the context died in: 0 only when the frame
+    // was decoded fully and correctly, which is what frametest asserts on.
+    if dctx.is_null() {
+        return 0;
+    }
+    let stage = unsafe { (*(dctx as *mut Owned<Dctx>)).value.stage } as usize;
+    unsafe { owned_free(dctx as *mut Owned<Dctx>) };
+    stage
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
 pub extern "C" fn LZ4F_getBlockSize(blockSizeID: LZ4F_blockSizeID_t) -> usize {
-    unimplemented!("LZ4F_getBlockSize")
+    f_result(frame::get_block_size(blockSizeID))
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
 pub extern "C" fn LZ4F_getErrorCode(functionResult: usize) -> LZ4F_errorCodes {
-    unimplemented!("LZ4F_getErrorCode")
+    frame::error_code(functionResult) as LZ4F_errorCodes
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
 pub extern "C" fn LZ4F_getErrorName(code: LZ4F_errorCode_t) -> *const c_char {
-    unimplemented!("LZ4F_getErrorName")
+    // C returns a pointer into a static string table, valid for the life of the
+    // program. Our statics are NUL-terminated for exactly this reason.
+    let idx = frame::error_code(code);
+    let s: &'static [u8] = if frame::is_error(code) && (idx as usize) < frame::ERROR_STRINGS.len() {
+        frame::ERROR_STRINGS[idx as usize]
+    } else {
+        b"Unspecified error code\0"
+    };
+    s.as_ptr() as *const c_char
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_getFrameInfo(dctx: *mut LZ4F_dctx, frameInfoPtr: *mut LZ4F_frameInfo_t, srcBuffer: *const c_void, srcSizePtr: *mut usize) -> usize {
-    unimplemented!("LZ4F_getFrameInfo")
+pub unsafe extern "C" fn LZ4F_getFrameInfo(dctx: *mut LZ4F_dctx, frameInfoPtr: *mut LZ4F_frameInfo_t, srcBuffer: *const c_void, srcSizePtr: *mut usize) -> usize {
+    if dctx.is_null() {
+        return frame::Error::ParameterNull.to_code();
+    }
+    if frameInfoPtr.is_null() || srcSizePtr.is_null() {
+        return frame::Error::ParameterNull.to_code();
+    }
+    let d = unsafe { &mut (*(dctx as *mut Owned<Dctx>)).value };
+    let src_len = unsafe { *srcSizePtr };
+    let src = unsafe { opt_slice(srcBuffer, src_len) };
+    match frame::get_frame_info(d, src) {
+        Ok((fi, consumed, hint)) => {
+            unsafe {
+                *srcSizePtr = consumed;
+                write_frame_info(frameInfoPtr, &fi);
+            }
+            hint
+        }
+        Err(e) => {
+            // On error C leaves dctx untouched and reports nothing consumed.
+            unsafe { *srcSizePtr = 0 };
+            e.to_code()
+        }
+    }
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
 pub extern "C" fn LZ4F_getVersion() -> c_uint {
-    unimplemented!("LZ4F_getVersion")
+    frame::LZ4F_VERSION as c_uint
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_headerSize(src: *const c_void, srcSize: usize) -> usize {
-    unimplemented!("LZ4F_headerSize")
+pub unsafe extern "C" fn LZ4F_headerSize(src: *const c_void, srcSize: usize) -> usize {
+    if src.is_null() {
+        return frame::Error::SrcPtrWrong.to_code();
+    }
+    let s = unsafe { opt_slice(src, srcSize) };
+    f_result(frame::header_size(s))
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
 pub extern "C" fn LZ4F_isError(code: LZ4F_errorCode_t) -> c_uint {
-    unimplemented!("LZ4F_isError")
+    c_uint::from(frame::is_error(code))
+}
+
+
+// ===========================================================================
+// File API (lib/lz4file.c)
+// ===========================================================================
+//
+// This layer works on a `FILE*` the C caller owns and may already have read
+// from, so the stream cannot be re-opened as a Rust `File` — duplicating the
+// descriptor would desynchronise the file position. The stdio calls therefore
+// live here, declared directly, and everything else is in `crate::file`.
+
+extern "C" {
+    fn fread(ptr: *mut c_void, size: usize, nmemb: usize, stream: *mut FILE) -> usize;
+    fn fwrite(ptr: *const c_void, size: usize, nmemb: usize, stream: *mut FILE) -> usize;
+    fn ferror(stream: *mut FILE) -> c_int;
+}
+
+/// `crate::file::Io` over the caller's `FILE*`.
+struct CFile(*mut FILE);
+
+impl crate::file::Io for CFile {
+    fn read(&mut self, buf: &mut [u8]) -> usize {
+        if buf.is_empty() {
+            return 0;
+        }
+        unsafe { fread(buf.as_mut_ptr() as *mut c_void, 1, buf.len(), self.0) }
+    }
+    fn write(&mut self, buf: &[u8]) -> usize {
+        if buf.is_empty() {
+            return 0;
+        }
+        unsafe { fwrite(buf.as_ptr() as *const c_void, 1, buf.len(), self.0) }
+    }
+    fn error(&mut self) -> bool {
+        unsafe { ferror(self.0) != 0 }
+    }
+}
+
+/// The handles C holds: our state plus the stream it is bound to. C keeps the
+/// `FILE*` inside its own struct too (lz4file.c:54, :207), so the pairing is
+/// the original's, not an invention.
+struct ReadHandle {
+    state: crate::file::ReadFile,
+    fp: *mut FILE,
+}
+
+struct WriteHandle {
+    state: crate::file::WriteFile,
+    fp: *mut FILE,
 }
 
 /// from lib/lz4file.h
 #[no_mangle]
-pub extern "C" fn LZ4F_read(lz4fRead: *mut LZ4_readFile_t, buf: *mut c_void, size: usize) -> usize {
-    unimplemented!("LZ4F_read")
+pub unsafe extern "C" fn LZ4F_read(lz4fRead: *mut LZ4_readFile_t, buf: *mut c_void, size: usize) -> usize {
+    if lz4fRead.is_null() || buf.is_null() {
+        return frame::Error::ParameterNull.to_code();
+    }
+    let h = unsafe { &mut *(lz4fRead as *mut ReadHandle) };
+    let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, size) };
+    let mut io = CFile(h.fp);
+    match h.state.read(&mut io, out) {
+        Ok(n) => n,
+        Err(e) => e.to_code(),
+    }
 }
 
 /// from lib/lz4file.h
 #[no_mangle]
-pub extern "C" fn LZ4F_readClose(lz4fRead: *mut LZ4_readFile_t) -> LZ4F_errorCode_t {
-    unimplemented!("LZ4F_readClose")
+pub unsafe extern "C" fn LZ4F_readClose(lz4fRead: *mut LZ4_readFile_t) -> LZ4F_errorCode_t {
+    if lz4fRead.is_null() {
+        return frame::Error::ParameterNull.to_code();
+    }
+    drop(unsafe { Box::from_raw(lz4fRead as *mut ReadHandle) });
+    0
 }
 
 /// from lib/lz4file.h
 #[no_mangle]
-pub extern "C" fn LZ4F_readOpen(lz4fRead: *mut *mut LZ4_readFile_t, fp: *mut FILE) -> LZ4F_errorCode_t {
-    unimplemented!("LZ4F_readOpen")
+pub unsafe extern "C" fn LZ4F_readOpen(lz4fRead: *mut *mut LZ4_readFile_t, fp: *mut FILE) -> LZ4F_errorCode_t {
+    if fp.is_null() || lz4fRead.is_null() {
+        return frame::Error::ParameterNull.to_code();
+    }
+    let mut io = CFile(fp);
+    match crate::file::ReadFile::open(&mut io) {
+        Ok(state) => {
+            let h = Box::new(ReadHandle { state, fp });
+            unsafe { *lz4fRead = Box::into_raw(h) as *mut LZ4_readFile_t };
+            0
+        }
+        Err(e) => e.to_code(),
+    }
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_resetDecompressionContext(dctx: *mut LZ4F_dctx) {
-    unimplemented!("LZ4F_resetDecompressionContext")
+pub unsafe extern "C" fn LZ4F_resetDecompressionContext(dctx: *mut LZ4F_dctx) {
+    if dctx.is_null() {
+        return;
+    }
+    unsafe { &mut (*(dctx as *mut Owned<Dctx>)).value }.reset()
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub extern "C" fn LZ4F_uncompressedUpdate(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, srcBuffer: *const c_void, srcSize: usize, cOptPtr: *const LZ4F_compressOptions_t) -> usize {
-    unimplemented!("LZ4F_uncompressedUpdate")
+pub unsafe extern "C" fn LZ4F_uncompressedUpdate(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, srcBuffer: *const c_void, srcSize: usize, cOptPtr: *const LZ4F_compressOptions_t) -> usize {
+    if cctx.is_null() {
+        return frame::Error::ParameterNull.to_code();
+    }
+    let c = unsafe { &mut (*(cctx as *mut Owned<Cctx>)).value };
+    let dst = unsafe { opt_slice_mut(dstBuffer, dstCapacity) };
+    let src = unsafe { opt_slice(srcBuffer, srcSize) };
+    f_result(c.update(dst, src, BlockCompressMode::Uncompressed))
 }
 
 /// from lib/lz4file.h
 #[no_mangle]
-pub extern "C" fn LZ4F_write(lz4fWrite: *mut LZ4_writeFile_t, buf: *const c_void, size: usize) -> usize {
-    unimplemented!("LZ4F_write")
+pub unsafe extern "C" fn LZ4F_write(lz4fWrite: *mut LZ4_writeFile_t, buf: *const c_void, size: usize) -> usize {
+    if lz4fWrite.is_null() || buf.is_null() {
+        return frame::Error::ParameterNull.to_code();
+    }
+    let h = unsafe { &mut *(lz4fWrite as *mut WriteHandle) };
+    let src = unsafe { slice::from_raw_parts(buf as *const u8, size) };
+    let mut io = CFile(h.fp);
+    match h.state.write(&mut io, src) {
+        Ok(n) => n,
+        Err(e) => e.to_code(),
+    }
 }
 
 /// from lib/lz4file.h
 #[no_mangle]
-pub extern "C" fn LZ4F_writeClose(lz4fWrite: *mut LZ4_writeFile_t) -> LZ4F_errorCode_t {
-    unimplemented!("LZ4F_writeClose")
+pub unsafe extern "C" fn LZ4F_writeClose(lz4fWrite: *mut LZ4_writeFile_t) -> LZ4F_errorCode_t {
+    if lz4fWrite.is_null() {
+        return frame::Error::ParameterNull.to_code();
+    }
+    // The state is freed either way, as C does: `freeWriteFileResources` runs
+    // past the `cleanup` label on both paths.
+    let mut h = unsafe { Box::from_raw(lz4fWrite as *mut WriteHandle) };
+    let mut io = CFile(h.fp);
+    match h.state.close(&mut io) {
+        Ok(()) => 0,
+        Err(e) => e.to_code(),
+    }
 }
 
 /// from lib/lz4file.h
 #[no_mangle]
-pub extern "C" fn LZ4F_writeOpen(lz4fWrite: *mut *mut LZ4_writeFile_t, fp: *mut FILE, prefsPtr: *const LZ4F_preferences_t) -> LZ4F_errorCode_t {
-    unimplemented!("LZ4F_writeOpen")
+pub unsafe extern "C" fn LZ4F_writeOpen(lz4fWrite: *mut *mut LZ4_writeFile_t, fp: *mut FILE, prefsPtr: *const LZ4F_preferences_t) -> LZ4F_errorCode_t {
+    if fp.is_null() || lz4fWrite.is_null() {
+        return frame::Error::ParameterNull.to_code();
+    }
+    let mut io = CFile(fp);
+    let prefs = unsafe { read_prefs(prefsPtr) };
+    match crate::file::WriteFile::open(&mut io, prefs.as_ref()) {
+        Ok(state) => {
+            let h = Box::new(WriteHandle { state, fp });
+            unsafe { *lz4fWrite = Box::into_raw(h) as *mut LZ4_writeFile_t };
+            0
+        }
+        Err(e) => e.to_code(),
+    }
 }
 
 // ─── XXH helpers ─────────────────────────────────────────────────────────────
@@ -328,7 +825,6 @@ pub extern "C" fn LZ4F_writeOpen(lz4fWrite: *mut *mut LZ4_writeFile_t, fp: *mut 
 // here are checked end-to-end at compile time.
 
 use crate::xxh::{Xxh32State, Xxh64State};
-use core::slice;
 
 const _: () = {
     assert!(core::mem::size_of::<Xxh32State>() == core::mem::size_of::<XXH32_state_t>());

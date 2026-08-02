@@ -283,7 +283,12 @@ abi-check: $(RUST_LIB) $(ABI_TXT)
 	@nm --defined-only --extern-only $(RUST_LIB) \
 	  | awk '$$2 == "T" {print $$3}' | grep -E '^(LZ4_|LZ4F_)' | sort -u > $(CURDIR)/abi.rust.txt
 	@echo "original: $$(wc -l < $(ABI_TXT))  rust: $$(wc -l < $(CURDIR)/abi.rust.txt)"
-	@diff -u $(ABI_TXT) $(CURDIR)/abi.rust.txt \
+	@# Compare under a fixed collation. `abi.txt` was recorded with a
+	@# locale-dependent sort, so without LC_ALL the two sides can disagree on
+	@# case ordering alone and report a mismatch with identical symbol sets.
+	@LC_ALL=C sort $(ABI_TXT) > $(CURDIR)/abi.orig.sorted.txt
+	@LC_ALL=C sort $(CURDIR)/abi.rust.txt > $(CURDIR)/abi.rust.sorted.txt
+	@diff -u $(CURDIR)/abi.orig.sorted.txt $(CURDIR)/abi.rust.sorted.txt \
 	  && echo "OK: Rust archive exports exactly the original ABI." \
 	  || { echo "MISMATCH: see diff above."; exit 1; }
 
@@ -291,3 +296,4 @@ abi-check: $(RUST_LIB) $(ABI_TXT)
 clean:
 	cargo clean
 	$(RM) $(CURDIR)/abi.rust.txt
+	$(RM) $(CURDIR)/abi.rust.sorted.txt $(CURDIR)/abi.orig.sorted.txt

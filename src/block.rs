@@ -108,6 +108,11 @@ impl<'a> Input<'a> {
     }
 
     #[inline]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
     fn window<'b>(&'b self, buf: &'b [u8], at: usize, n: usize) -> &'b [u8] {
         match self {
             Input::Separate(s) => &s[at..at + n],
@@ -161,6 +166,222 @@ enum TableType {
     U32,
 }
 
+/// `dict_directive` (lz4.c:751), minus `usingDictCtx`.
+///
+/// C instantiates the whole compressor once per directive via
+/// `LZ4_FORCE_INLINE`; we branch at run time instead. The branches themselves
+/// are transcribed verbatim, because each one changes which matches are found
+/// and therefore the compressed bytes.
+///
+/// `usingDictCtx` is deliberately absent: it is an *optimisation* for attached
+/// `LZ4F_CDict`s, and C only selects it for inputs ≤ 4 KB (lz4.c:1771-1780).
+/// Above that it `memcpy`s the dictionary context into the working stream and
+/// uses `usingExtDict`. Frame-level `CDict` support takes that same path
+/// unconditionally — see `frame::cdict_as_ext`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DictDirective {
+    /// No preceding content.
+    NoDict,
+    /// The dictionary immediately precedes `src` in memory: one contiguous
+    /// segment, so a match may reach back past the block start.
+    WithPrefix64k,
+    /// The dictionary lives in a separate allocation.
+    UsingExtDict,
+}
+
+/// `dictIssue_directive` (lz4.c:752). `DictSmall` means the dictionary is
+/// shorter than 64 KB, so table entries below `prefixIdxLimit` point at content
+/// that no longer exists and must be skipped (lz4.c:1097).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DictIssue {
+    NoDictIssue,
+    DictSmall,
+}
+
+/// The compressor's view of the bytes preceding this block, in **index space**.
+///
+/// C addresses history with pointers into one virtual byte stream: `base =
+/// source - currentOffset`, so a table entry `matchIndex` is `base +
+/// matchIndex`, which may land in the dictionary or in the current block. We
+/// keep the same index space but resolve it explicitly, because the dictionary
+/// is a genuinely separate slice here (it cannot be part of `buf`, which the
+/// caller may also be compressing in place).
+///
+/// Index layout, for `start_index = currentOffset` at entry:
+///
+/// ```text
+///   dictionary bytes            current block
+///   [start_index - dict_size, start_index) [start_index, start_index + len)
+/// ```
+///
+/// `WithPrefix64k` and `UsingExtDict` differ in C by whether those two regions
+/// are physically adjacent. They are always separate slices here, and the
+/// two-part match count below reproduces the contiguous count exactly, so the
+/// emitted bytes are identical either way. What the directive still decides —
+/// and what is therefore ported literally — is the `low_limit` used for
+/// catch-up and the `DictSmall` candidate filter.
+struct Hist<'a> {
+    content: &'a [u8],
+    start_index: u32,
+    dict_size: u32,
+}
+
+impl<'a> Hist<'a> {
+    /// First valid index of the dictionary region.
+    #[inline]
+    fn dict_base_index(&self) -> u32 {
+        self.start_index - self.dict_size
+    }
+
+    /// Offset of index `mi` within `content`. Only valid when `mi <
+    /// start_index`.
+    #[inline]
+    fn dict_at(&self, mi: u32) -> usize {
+        (mi - self.dict_base_index()) as usize
+    }
+
+    /// `LZ4_read32(base + matchIndex)`.
+    ///
+    /// `None` where C would read past the end of the dictionary buffer. That is
+    /// unreachable for tables built by this crate: `load_dict` only indexes
+    /// positions up to `dictEnd - 8`, and the main loop never indexes past
+    /// `mflimitPlusOne`, which is 11 bytes short of the block end — hence C's
+    /// `assert(startIndex - matchIndex >= MINMATCH)` (lz4.c:1082). Treating it
+    /// as "no match" keeps a corrupt state from panicking.
+    #[inline]
+    fn read32(&self, input: &Input, buf: &[u8], mi: u32) -> Option<u32> {
+        if mi >= self.start_index {
+            let at = (mi - self.start_index) as usize;
+            (at + 4 <= input.len()).then(|| input.u32_ne(buf, at))
+        } else {
+            let at = self.dict_at(mi);
+            (at + 4 <= self.content.len())
+                .then(|| u32::from_ne_bytes(self.content[at..at + 4].try_into().unwrap()))
+        }
+    }
+
+    /// A single byte at index `mi`, for the catch-up loop.
+    #[inline]
+    fn byte(&self, input: &Input, buf: &[u8], mi: u32) -> u8 {
+        if mi >= self.start_index {
+            input.byte(buf, (mi - self.start_index) as usize)
+        } else {
+            self.content[self.dict_at(mi)]
+        }
+    }
+}
+
+/// The hash table plus the streaming state C keeps beside it. Held across
+/// blocks by `frame`, and by the block-level streaming API.
+pub struct StreamState {
+    table: Table,
+    /// `cctx->currentOffset` (lz4.c:955). Indices in `table` are relative to
+    /// this, so it must survive between blocks.
+    current_offset: u32,
+    /// `cctx->dictSize` — how much history precedes the current block.
+    dict_size: u32,
+    tt: TableType,
+}
+
+impl StreamState {
+    pub fn new() -> Self {
+        StreamState {
+            table: Table::new(TableType::U32),
+            current_offset: 0,
+            dict_size: 0,
+            tt: TableType::U32,
+        }
+    }
+
+    /// `LZ4_resetStream_fast` (lz4.c:1553) — drop the history but keep the
+    /// table, which stays valid because indices are offset-relative.
+    pub fn reset_fast(&mut self) {
+        self.dict_size = 0;
+        // C keeps currentOffset, so stale entries remain distinguishable.
+    }
+
+    /// `LZ4_resetStream` — a full reset, table included.
+    pub fn reset(&mut self) {
+        self.table.clear();
+        self.current_offset = 0;
+        self.dict_size = 0;
+        self.tt = TableType::U32;
+    }
+
+    /// `LZ4_saveDict` (lz4.c:1823) — declare how much history is actually being
+    /// retained, after the caller has copied that many trailing bytes somewhere
+    /// safe.
+    ///
+    /// This must be called between blocks whenever the history is shortened,
+    /// and getting it wrong is silent: `dict_size` is what places the dictionary
+    /// in the compressor's index space, so a value larger than the retained
+    /// slice makes every dictionary index point at the wrong byte. Matches are
+    /// then rejected by the `read32` comparison instead of found, which costs
+    /// compression ratio without ever producing invalid output — exactly the
+    /// class of bug round-trip tests cannot see.
+    pub fn save_dict(&mut self, retained: usize) {
+        let retained = retained.min(64 * 1024) as u32;
+        self.dict_size = retained.min(self.dict_size);
+    }
+
+    /// `LZ4_loadDict_internal` (lz4.c:1596). `slow` is C's `_ld_slow`, which
+    /// adds a second indexing pass that favours positions near the *start* of
+    /// the dictionary; `LZ4F_createCDict` uses it (lz4frame.c:569).
+    pub fn load_dict(&mut self, dict: &[u8], slow: bool) -> usize {
+        const HASH_UNIT: usize = 8; // sizeof(reg_t) on 64-bit
+        self.reset();
+
+        // Always advance a whole window, even for a shorter dictionary: that is
+        // what lets `compress_continue` use `NoDictIssue` regardless of the
+        // dictionary's real length (lz4.c:1614-1620).
+        self.current_offset += 64 * 1024;
+
+        if dict.len() < HASH_UNIT {
+            return 0;
+        }
+
+        let start = dict.len().saturating_sub(64 * 1024);
+        let d = &dict[start..];
+        self.dict_size = d.len() as u32;
+        self.tt = TableType::U32;
+
+        let input = Input::Separate(d);
+        let scratch: [u8; 0] = [];
+        let mut idx32 = self.current_offset - self.dict_size;
+        let mut p = 0usize;
+        while p + HASH_UNIT <= d.len() {
+            let h = hash_position(&input, &scratch, p, TableType::U32);
+            // Overwriting => favours positions at the end of the dictionary.
+            self.table.put(h, idx32);
+            p += 3;
+            idx32 += 3;
+        }
+
+        if slow {
+            let limit = self.current_offset - 64 * 1024;
+            let mut idx32 = self.current_offset - self.dict_size;
+            let mut p = 0usize;
+            while p + HASH_UNIT <= d.len() {
+                let h = hash_position(&input, &scratch, p, TableType::U32);
+                // Not overwriting => favours positions at the beginning.
+                if self.table.get(h) <= limit {
+                    self.table.put(h, idx32);
+                }
+                p += 1;
+                idx32 += 1;
+            }
+        }
+
+        self.dict_size as usize
+    }
+}
+
+impl Default for StreamState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The hash table. Element width and hash shift both follow `tableType`
 /// (PORTING.md §3.3) — this is the single most output-relevant choice in the
 /// compressor, so the two cases stay separate rather than being unified.
@@ -195,6 +416,14 @@ impl Table {
             Table::U32(t) => t[h as usize] = idx,
         }
     }
+
+    fn clear(&mut self) {
+        match self {
+            Table::U16(t) => t.fill(0),
+            Table::U32(t) => t.fill(0),
+        }
+    }
+
 }
 
 /// lz4.c:786.
@@ -245,16 +474,48 @@ fn count(input: &Input, buf: &[u8], mut p_in: usize, mut p_match: usize, limit: 
     p_in - start
 }
 
-/// `LZ4_compress_generic` (lz4.c:1353) + `_validated` (lz4.c:939), for
-/// `noDict`/`noDictIssue` — the one-shot, non-streaming case.
+/// `LZ4_count` where the match side is in *index* space and so may start in the
+/// dictionary and continue into the current block.
+///
+/// In C this is the same `LZ4_count` as above: the prefix and the block are one
+/// contiguous buffer, so walking off the end of one lands in the other. Here
+/// they are separate slices, so the crossing is explicit. `limit` bounds the
+/// *input* side, as in C.
+#[inline]
+fn count_hist(
+    input: &Input,
+    buf: &[u8],
+    hist: &Hist,
+    mut p_in: usize,
+    mut m_idx: u32,
+    limit: usize,
+) -> usize {
+    let start = p_in;
+    while p_in < limit && input.byte(buf, p_in) == hist.byte(input, buf, m_idx) {
+        p_in += 1;
+        m_idx += 1;
+    }
+    p_in - start
+}
+
+/// `LZ4_compress_generic` (lz4.c:1353) + `_validated` (lz4.c:939).
 ///
 /// `limited` selects `limitedOutput` vs `notLimited`: C picks `notLimited`
 /// when `dstCapacity >= LZ4_compressBound(srcSize)` (lz4.c:1397) and then
 /// skips every output bounds check, so this flag must be derived the same way.
+///
+/// `state` carries the table and index bookkeeping. For a one-shot compression
+/// it is freshly constructed and discarded; for linked blocks the caller holds
+/// it across calls, which is the whole of what makes them "linked".
+#[allow(clippy::too_many_arguments)]
 fn compress_generic(
     buf: &mut [u8],
     dst: Range<usize>,
     input: &Input,
+    state: &mut StreamState,
+    dict_content: &[u8],
+    directive: DictDirective,
+    dict_issue: DictIssue,
     tt: TableType,
     limited: bool,
     acceleration: i32,
@@ -274,8 +535,24 @@ fn compress_generic(
         return Ok(1);
     }
 
-    let mut table = Table::new(tt);
+    // lz4.c:955-1009 — the index space, then the state update that happens
+    // *before* the parse and is therefore visible to the next block.
+    let start_index = state.current_offset;
+    let hist = Hist {
+        content: dict_content,
+        start_index,
+        dict_size: state.dict_size,
+    };
+    // `prefixIdxLimit` (lz4.c:968): with DictSmall, candidates below this point
+    // at content that is no longer present.
+    let prefix_idx_limit = start_index - state.dict_size;
+    let maybe_ext_mem = directive == DictDirective::UsingExtDict;
 
+    state.dict_size += input_size as u32;
+    state.current_offset += input_size as u32;
+    state.tt = tt;
+
+    let table = &mut state.table;
     let iend = input_size;
     let mut op = dst.start;
     let olimit = dst.end;
@@ -293,14 +570,24 @@ fn compress_generic(
     let mflimit_plus_one = iend - MFLIMIT + 1;
 
     // lz4.c:1013-1020 — first byte, then advance one and prime forwardH.
+    // The table stores *indices*, so the first position is `startIndex`, not 0.
     let mut ip = 0usize;
     let h = hash_position(input, buf, ip, tt);
-    table.put(h, 0);
+    table.put(h, start_index);
     ip += 1;
     let mut forward_h = hash_position(input, buf, ip, tt);
 
+    // C's `offset`, only meaningful when `maybe_extMem` (lz4.c:985). For an
+    // ext-dict match `ip - match` is not the distance, because the two regions
+    // are not adjacent in our address space — the index difference is.
+    let mut ext_offset: u32 = 0;
+
     'main: loop {
-        let mut match_idx: usize;
+        // The match position, in index space.
+        let mut match_idx: u32;
+        // C's `lowLimit`: `dictionary` when the match is in the ext dict,
+        // `source` otherwise. Drives catch-up and the match-length count.
+        let mut match_in_dict: bool;
 
         // --- Find a match (lz4.c:1049-1110, the byU32/byU16 arm) ---
         {
@@ -309,8 +596,8 @@ fn compress_generic(
             let mut search_match_nb: u32 = (acceleration as u32) << LZ4_SKIP_TRIGGER;
             loop {
                 let h = forward_h;
-                let current = forward_ip;
-                let mi = table.get(h) as usize;
+                let current = (forward_ip + start_index as usize) as u32;
+                let mi = table.get(h);
                 ip = forward_ip;
                 forward_ip += step;
                 // Post-increment: the *old* counter picks the step (lz4.c:1062).
@@ -322,18 +609,38 @@ fn compress_generic(
                 }
 
                 forward_h = hash_position(input, buf, forward_ip, tt);
-                table.put(h, current as u32);
+                table.put(h, current);
 
+                match_in_dict = directive == DictDirective::UsingExtDict && mi < start_index;
+
+                // lz4.c:1097 — a candidate pointing into content that the
+                // (short) dictionary no longer covers.
+                if dict_issue == DictIssue::DictSmall && mi < prefix_idx_limit {
+                    continue;
+                }
                 // lz4.c:1099 — with LZ4_DISTANCE_MAX == LZ4_DISTANCE_ABSOLUTE_MAX
                 // the whole guard is dead for byU16, so it must not be applied
                 // there: a u16 table cannot express a distance that far anyway.
                 if (tt != TableType::U16 || LZ4_DISTANCE_MAX < LZ4_DISTANCE_ABSOLUTE_MAX)
-                    && mi + LZ4_DISTANCE_MAX < current
+                    && (mi as usize) + LZ4_DISTANCE_MAX < current as usize
                 {
                     continue;
                 }
 
-                if input.u32_ne(buf, mi) == input.u32_ne(buf, ip) {
+                // An index below the dictionary's own start is a stale entry
+                // from an earlier block whose content is gone. C cannot see
+                // this — its `base + matchIndex` still forms a readable
+                // address inside the old buffer, and the `LZ4_DISTANCE_MAX`
+                // test above is what rejects it. Here the same entry would
+                // index outside `content`, so it is filtered explicitly.
+                if mi < hist.dict_base_index() {
+                    continue;
+                }
+
+                if hist.read32(input, buf, mi) == Some(input.u32_ne(buf, ip)) {
+                    if maybe_ext_mem {
+                        ext_offset = current - mi;
+                    }
                     match_idx = mi;
                     break;
                 }
@@ -341,14 +648,28 @@ fn compress_generic(
         }
 
         // --- Catch up (lz4.c:1113-1118) ---
-        // `lowLimit` is the start of the input in the noDict case.
-        if match_idx > 0 && input.byte(buf, ip - 1) == input.byte(buf, match_idx - 1) {
+        //
+        // `lowLimit` is the dictionary start for an ext-dict match and the
+        // block start otherwise, so the walk-back stops at a different place in
+        // each case. It never crosses between the two regions, which is why a
+        // single index comparison suffices.
+        let low_limit: u32 = if match_in_dict {
+            hist.dict_base_index()
+        } else if directive == DictDirective::WithPrefix64k {
+            start_index - hist.dict_size
+        } else {
+            start_index
+        };
+        let ip_index = |ip: usize| (ip + start_index as usize) as u32;
+        if match_idx > low_limit
+            && input.byte(buf, ip - 1) == hist.byte(input, buf, match_idx - 1)
+        {
             loop {
                 ip -= 1;
                 match_idx -= 1;
-                if !(ip > anchor
-                    && match_idx > 0
-                    && input.byte(buf, ip - 1) == input.byte(buf, match_idx - 1))
+                if !(ip_index(ip) > anchor as u32 + start_index
+                    && match_idx > low_limit
+                    && input.byte(buf, ip - 1) == hist.byte(input, buf, match_idx - 1))
                 {
                     break;
                 }
@@ -386,15 +707,48 @@ fn compress_generic(
         // when the very next position also matches.
         loop {
             // --- Encode offset (lz4.c:1163-1172). Always little-endian. ---
-            let offset = (ip - match_idx) as u16;
+            //
+            // For an ext-dict match the distance is the index difference, which
+            // `ext_offset` already holds; `ip - match` would be meaningless
+            // because the dictionary is a separate allocation here.
+            let offset = if maybe_ext_mem {
+                ext_offset as u16
+            } else {
+                (ip_index(ip) - match_idx) as u16
+            };
             buf[op..op + 2].copy_from_slice(&offset.to_le_bytes());
             op += 2;
 
             // --- Encode match length (lz4.c:1174-1235) ---
             {
-                let mut match_code =
-                    count(input, buf, ip + MINMATCH, match_idx + MINMATCH, matchlimit);
-                ip += match_code + MINMATCH;
+                let mut match_code = if match_in_dict {
+                    // lz4.c:1177-1189 — an ext-dict match. The dictionary is a
+                    // separate segment, so the count stops at `dictEnd` and then
+                    // resumes at the *block start*, not at the following byte.
+                    // One straight count would run past the dictionary into
+                    // whatever follows it and emit a match C never emits.
+                    let mut limit = ip + (start_index - match_idx) as usize;
+                    if limit > matchlimit {
+                        limit = matchlimit;
+                    }
+                    let mut mc =
+                        count_hist(input, buf, &hist, ip + MINMATCH, match_idx + MINMATCH as u32, limit);
+                    ip += mc + MINMATCH;
+                    if ip == limit {
+                        let more = count(input, buf, limit, 0, matchlimit);
+                        mc += more;
+                        ip += more;
+                    }
+                    mc
+                } else {
+                    // Prefix mode reaches here with `match_idx < start_index`:
+                    // the prefix and the block are one contiguous segment in C,
+                    // so the count simply walks across the boundary.
+                    let mc =
+                        count_hist(input, buf, &hist, ip + MINMATCH, match_idx + MINMATCH as u32, matchlimit);
+                    ip += mc + MINMATCH;
+                    mc
+                };
 
                 if limited && op + (1 + LASTLITERALS) + (match_code + 240) / 255 > olimit {
                     return Err(Error::OutputTooSmall);
@@ -423,25 +777,35 @@ fn compress_generic(
 
             // --- Fill table (lz4.c:1244-1251) ---
             let h = hash_position(input, buf, ip - 2, tt);
-            table.put(h, (ip - 2) as u32);
+            table.put(h, ip_index(ip - 2));
 
             // --- Test next position (lz4.c:1262-1303) ---
             let h = hash_position(input, buf, ip, tt);
-            let current = ip;
-            let mi = table.get(h) as usize;
-            table.put(h, current as u32);
+            let current = ip_index(ip);
+            let mi = table.get(h);
+            table.put(h, current);
 
+            let in_dict = directive == DictDirective::UsingExtDict && mi < start_index;
             let near_enough = if tt == TableType::U16 && LZ4_DISTANCE_MAX == LZ4_DISTANCE_ABSOLUTE_MAX
             {
                 true
             } else {
-                mi + LZ4_DISTANCE_MAX >= current
+                (mi as usize) + LZ4_DISTANCE_MAX >= current as usize
             };
-            if near_enough && input.u32_ne(buf, mi) == input.u32_ne(buf, ip) {
+            let dict_ok = dict_issue != DictIssue::DictSmall || mi >= prefix_idx_limit;
+            if dict_ok
+                && near_enough
+                && mi >= hist.dict_base_index()
+                && hist.read32(input, buf, mi) == Some(input.u32_ne(buf, ip))
+            {
                 token = op;
                 buf[token] = 0;
                 op += 1;
+                if maybe_ext_mem {
+                    ext_offset = current - mi;
+                }
                 match_idx = mi;
+                match_in_dict = in_dict;
                 continue; // goto _next_match
             }
 
@@ -519,7 +883,91 @@ pub fn compress_fast(
     // lz4.c:1397 — `notLimited` when the destination provably cannot overflow.
     let limited = (dst_capacity as i64) < compress_bound(src_size as i32) as i64;
 
-    compress_generic(buf, dst, input, tt, limited, acceleration)
+    let mut state = StreamState {
+        table: Table::new(tt),
+        current_offset: 0,
+        dict_size: 0,
+        tt,
+    };
+    compress_generic(
+        buf,
+        dst,
+        input,
+        &mut state,
+        &[],
+        DictDirective::NoDict,
+        DictIssue::NoDictIssue,
+        tt,
+        limited,
+        acceleration,
+    )
+}
+
+/// `LZ4_compress_fast_continue` (lz4.c:1716) — one block of a linked stream.
+///
+/// `dict` is the history preceding this block: the previous block's bytes, or a
+/// loaded dictionary. `prefix` says whether those bytes sit immediately before
+/// `src` in the caller's address space, which is what selects `withPrefix64k`
+/// over `usingExtDict` in C. Both count matches across the boundary; the
+/// directive additionally decides `lowLimit` and the offset encoding.
+///
+/// The stream's `dictSize`/`currentOffset` are updated by `compress_generic`, so
+/// consecutive calls see a growing history exactly as C does.
+pub fn compress_continue(
+    buf: &mut [u8],
+    dst: Range<usize>,
+    input: &Input,
+    state: &mut StreamState,
+    dict: &[u8],
+    prefix: bool,
+    acceleration: i32,
+) -> Result<usize, Error> {
+    let mut acceleration = acceleration;
+    if acceleration < 1 {
+        acceleration = LZ4_ACCELERATION_DEFAULT;
+    }
+    if acceleration > LZ4_ACCELERATION_MAX {
+        acceleration = LZ4_ACCELERATION_MAX;
+    }
+
+    // lz4.c:1731-1742 — a dictionary too short to hash is dropped rather than
+    // carried, so the faster prefix path can be used.
+    if state.dict_size < 4 && !prefix && !input.is_empty() {
+        state.dict_size = 0;
+    }
+
+    // lz4.c:1721 — streaming is always byU32, whatever the block size.
+    let tt = TableType::U32;
+    let dst_capacity = dst.end - dst.start;
+    let _ = dst_capacity;
+
+    let (directive, issue) = if prefix {
+        // lz4.c:1755-1759
+        let issue = if (state.dict_size as usize) < 64 * 1024
+            && state.dict_size < state.current_offset
+        {
+            DictIssue::DictSmall
+        } else {
+            DictIssue::NoDictIssue
+        };
+        (DictDirective::WithPrefix64k, issue)
+    } else {
+        // lz4.c:1781-1786
+        let issue = if (state.dict_size as usize) < 64 * 1024
+            && state.dict_size < state.current_offset
+        {
+            DictIssue::DictSmall
+        } else {
+            DictIssue::NoDictIssue
+        };
+        (DictDirective::UsingExtDict, issue)
+    };
+
+    // C always uses `limitedOutput` here (lz4.c:1757) — a streaming caller's
+    // dstCapacity is never assumed to cover the bound.
+    compress_generic(
+        buf, dst, input, state, dict, directive, issue, tt, true, acceleration,
+    )
 }
 
 // ===========================================================================
@@ -564,8 +1012,43 @@ pub fn decompress_generic(
     partial: bool,
     target_output_size: usize,
 ) -> Result<usize, Error> {
+    decompress_dict(buf, dst, input, partial, target_output_size, &[], 0)
+}
+
+/// `LZ4_decompress_safe_usingDict` (lz4.c:2738) and the generic decoder behind
+/// it, for all three dict directives.
+///
+/// `ext_dict` is the dictionary content when it lives in its own allocation
+/// (`usingExtDict`). `prefix_size` is non-zero when the history instead sits
+/// immediately *before* `dst.start` inside `buf` — the prefix case, where the
+/// match simply reads earlier bytes of the same buffer.
+///
+/// The two are mutually exclusive, matching C's dispatch: `dictStart + dictSize
+/// == dest` selects a prefix, anything else an external dictionary.
+pub fn decompress_dict(
+    buf: &mut [u8],
+    dst: Range<usize>,
+    input: &Input,
+    partial: bool,
+    target_output_size: usize,
+    ext_dict: &[u8],
+    prefix_size: usize,
+) -> Result<usize, Error> {
     let src_size = input.len();
     let dst_start = dst.start;
+
+    // C's `lowPrefix`: `dest - prefixSize`, the earliest byte a match may read
+    // within the output buffer itself.
+    let low_prefix = dst_start - prefix_size;
+    let using_ext = !ext_dict.is_empty();
+    // `dictSize` (lz4.c:2032) — the ext dict's length, or the prefix's, since
+    // both are "history that precedes the block". Only the ext-dict case can
+    // reach outside `buf`.
+    let dict_size = if using_ext { ext_dict.len() } else { prefix_size };
+    // lz4.c:2046 — with a full 64 KB of history the offset can't escape it, so
+    // C skips the check entirely. Reproduced because it decides what is
+    // *rejected*, and rejection parity is half of behavioural equivalence.
+    let check_offset = dict_size < 64 * 1024;
 
     // With partial decoding the effective output end is the smaller of the
     // caller's capacity and what they asked for (lz4.c:2478-2485).
@@ -621,8 +1104,15 @@ pub fn decompress_generic(
             ip += 2;
 
             // Stage 2: only for matches that need no length extension and
-            // cannot overlap (offset >= 8), and that stay inside the output.
-            if match_len != ML_MASK as usize && offset >= 8 && offset <= op - dst_start {
+            // cannot overlap (offset >= 8), and whose source is in the
+            // contiguous history — `dict == withPrefix64k || match >= lowPrefix`
+            // (lz4.c:2257-2259). With a prefix, `lowPrefix` is *below*
+            // `dst.start`, so a match reaching before the block start is
+            // legitimate here and this stage still applies.
+            if match_len != ML_MASK as usize
+                && offset >= 8
+                && (prefix_size >= 64 * 1024 || op as isize - offset as isize >= low_prefix as isize)
+            {
                 copy_match(buf, op, op - offset, match_len + MINMATCH);
                 op += match_len + MINMATCH;
                 continue;
@@ -716,18 +1206,60 @@ pub fn decompress_generic(
         }
         length += MINMATCH;
 
-        // The match may not reach behind the start of the output (lz4.c:2375,
-        // `match + dictSize < lowPrefix` with dictSize == 0).
+        // How far back a match may legally reach (lz4.c:2375). `low_prefix` is
+        // the start of the contiguous history inside `buf`: `dst.start` with no
+        // prefix, earlier when the caller placed history immediately before the
+        // output. A match may additionally reach into `ext_dict`, which is a
+        // separate allocation, hence the `+ dict_size` slack.
+        //
+        // Signed arithmetic: `op - offset` legitimately lands *before*
+        // `dst.start` in both dict modes, so this cannot be done in `usize`.
         //
         // Note what is NOT rejected here: `offset == 0`. It is malformed, but
         // C does not error on it -- `match == op` passes the check above -- and
         // it is reachable from corrupt input. Rejecting it is a real
         // divergence; a differential run caught C returning 13 where we
         // returned -8.
-        if offset > op - dst_start {
+        let match_i = op as isize - offset as isize;
+        if check_offset && match_i + (dict_size as isize) < (low_prefix as isize) {
             return Err(Error::Malformed { consumed: ip });
         }
-        let match_pos = op - offset;
+
+        // --- match starting within the external dictionary (lz4.c:2377-2403) ---
+        if using_ext && match_i < low_prefix as isize {
+            if op + length > oend.saturating_sub(LASTLITERALS) {
+                if partial {
+                    length = core::cmp::min(length, oend - op);
+                } else {
+                    return Err(Error::Malformed { consumed: ip });
+                }
+            }
+            // Distance from the match to the end of the dictionary.
+            let from_dict = (low_prefix as isize - match_i) as usize;
+            if length <= from_dict {
+                // Entirely inside the dictionary.
+                let at = ext_dict.len() - from_dict;
+                buf[op..op + length].copy_from_slice(&ext_dict[at..at + length]);
+                op += length;
+            } else {
+                // Straddles the boundary: the tail continues at `low_prefix`.
+                // lz4.c:2388-2401 — and the tail may itself overlap what this
+                // copy is writing, so that half stays byte-at-a-time.
+                let rest = length - from_dict;
+                let at = ext_dict.len() - from_dict;
+                buf[op..op + from_dict].copy_from_slice(&ext_dict[at..at + from_dict]);
+                op += from_dict;
+                if rest > op - low_prefix {
+                    copy_match(buf, op, low_prefix, rest);
+                } else {
+                    buf.copy_within(low_prefix..low_prefix + rest, op);
+                }
+                op += rest;
+            }
+            continue;
+        }
+
+        let match_pos = match_i as usize;
 
         // --- copy match (lz4.c:2406-2453) ---
         let cpy = op + length;

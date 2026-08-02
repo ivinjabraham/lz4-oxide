@@ -1,8 +1,11 @@
 /target
 
-# Transient output of `make abi-check` (the Rust side of the comparison).
+# Transient output of `make abi-check` (the Rust side of the comparison, plus
+# the locale-normalised copies of both sides).
 # The committed abi.txt is the reference contract and IS tracked.
 /abi.rust.txt
+/abi.rust.sorted.txt
+/abi.orig.sorted.txt
 
 *.o
 *.a
