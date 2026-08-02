@@ -711,6 +711,51 @@ the `U16`/`U32` enum, on every position examined. C pays none of it, because
 type. Monomorphising ours the same way is the next lever, and it is a refactor
 rather than an algorithm change.
 
+### The margin comparisons must be additive, not `saturating_sub`
+
+Reproducing the overcopy made a latent translation error load-bearing, and it is
+worth recording because the shape recurs everywhere in this decoder.
+
+C computes `oend - MFLIMIT`, `oend - 32` and `iend - 16` as **pointers**. On a
+block shorter than the margin those land before the buffer, so `op <= oend-32`
+is false and `cpy > oend-MFLIMIT` is true — either way the guarded fast path is
+unavailable and the careful path runs. `saturating_sub` clamps to `0` instead,
+and for the first sequence of a block written at offset 0 both comparisons flip
+the wrong way. Two bugs followed, both reachable only through a tiny output
+buffer, i.e. `LZ4_decompress_safe_partial` with a small `targetOutputSize`:
+
+* The two-stage shortcut ran on buffers smaller than its 32-byte margin, `op`
+  walked past `oend`, and `length = oend - op` underflowed. `fuzzer -i2000
+  -s7354` died on a 7-byte buffer. `tests/Makefile:327` seeds the fuzzer
+  randomly, so `test-fuzzer` was failing about **1 run in 12** — a suite that
+  is green on a lucky seed is not green.
+* The literal parsing restriction let a zero-length run take the unrestricted
+  branch. Harmless while that branch held an exact `memcpy`; once it became a
+  wildcopy that always moves 8 bytes, it wrote past a 1-byte buffer.
+
+Both are now written additively (`op + 32 <= oend`, `cpy + MFLIMIT > oend`),
+which cannot underflow and is exactly C's comparison. The lesson is in
+[PORTING.md §3.2](PORTING.md).
+
+### Rejection parity is what found it
+
+None of this is visible to a round trip: the inputs are corrupt or the capacity
+is far below the output size, so there is nothing to compare against. What
+discriminates is **the return code** — LZ4 position-encodes decode errors
+(`-(ip-src)-1`, lz4.c:2462), so comparing the integer compares *where* each
+implementation decided the block was malformed, not merely that it did.
+
+`bench/verify.sh` sweeps `LZ4_decompress_safe` and
+`LZ4_decompress_safe_partial` at capacities 1..4096 across the 32-byte margin,
+over clean, header-corrupted, mid-corrupted, tail-corrupted and truncated
+input, comparing that return code and a hash of the bytes actually produced:
+**1261/1261 identical.**
+
+It was 1234/1261 before this section's work — and **27 of those divergences
+predate the copy work entirely**. They were a pre-existing rejection-parity gap
+in `LZ4_decompress_safe` on corrupt input at small capacities, invisible to
+every test the project had, and the same additive guards fix them.
+
 ### One regression in fail-loudness, recorded deliberately
 
 `common_bytes` clamps its length against both slices, so a caller that violates
@@ -741,8 +786,11 @@ where C merely reads a word past the match end, which is why it is still there.
       Killed decompressors #5/#6/#8 in `fullbench` and stopped `make test` at
       `test-fullbench`. `make test` now exits 0 end to end.
 - [ ] Differential fuzz harness (C reference vs Rust, valid **and** malformed input)
-      — `fuzz/hc_difftest.c` covers the HC surface (§8.2); the generic block and
-      malformed-input halves are still missing
+      — `fuzz/hc_difftest.c` covers the HC surface (§8.2); `bench/verify.sh`
+      covers the block and frame codecs on valid input and the block decoder on
+      malformed input, **including rejection parity** (§8.4, 1261 comparisons).
+      Missing: the frame decoder on malformed input, and a generative loop
+      rather than a fixed sweep
 - [ ] Benchmark report: p99, RSS, startup, with methodology — throughput vs C
       is done and reproducible (§8.4, `bench/`); p99, RSS and startup are not
 - [ ] **Port `LZ4_FAST_DEC_LOOP`** (§8.4). The second of `block.rs`'s two stated
