@@ -580,6 +580,56 @@ levels 1 and 2: **18 transcripts, all byte-identical** (`fuzz/driver.sh`).
 
 ---
 
+## 8.3 The prefix decode path: history must not be *read*, only addressed
+
+`LZ4_decompress_safe_withPrefix64k` and the prefix arm of
+`LZ4_decompress_safe{,_partial}_usingDict` segfaulted — `fullbench`
+decompressors #5, #6 and #8 — because `decompress_safe_histories` staged the
+decode through a scratch `Vec`: allocate `prefix_size + output_size`, **copy the
+prefix in**, decode, copy the result back out.
+
+The copy is the bug. C's decoder never reads the history up front; it reads a
+byte of it only when a match offset actually reaches back that far. The two
+differ whenever the prefix is nominally addressable but not really there, and
+that is not a corner case the suite stumbled into by accident —
+`fullbench.c:320` calls
+
+```c
+LZ4_decompress_safe_withPrefix64k(in, out, inSize, outSize);   /* out == orig_buff */
+```
+
+with `out` the head of a `malloc(benchedSize)`. The 64 KB "prefix" before it is
+unmapped. C is fine, because `fullbench` compressed that data with no
+dictionary, so no offset points below `out`. We touched all 65,536 bytes and
+died. Note that C is *also* reading a pointer it has no right to form here —
+this is arguably a latent bug in the harness — but the contract we owe is
+behavioural equivalence, and C's laziness makes it unobservable.
+
+The fix is to stop materialising the prefix and address it in place. A prefix is
+contiguous with `dst` **by definition** — it is the mode C selects exactly when
+`dictStart + dictSize == dst` — so one slice spans `[dst - prefix_size,
+dst + output_size)` with the block at offset `prefix_size`, and `low_prefix`
+arithmetic in `decompress_dict` already handles the rest unchanged. No scratch
+buffer, no copy back, and one fewer allocation per call on the hot path.
+
+The overlap case still needs care: `src` may lie *inside* the output allocation
+(in-place decompression, `LZ4_DECOMPRESS_INPLACE_BUFFER_SIZE`), and holding
+`&[u8]` and `&mut [u8]` over the same bytes is UB. That branch spans both
+regions into one slice and indexes in, the same trick `with_buffers` uses.
+
+**How it was checked.** `fuzzer -i3000`, `frametest -i50`, and all 13 `fullbench`
+decompressors (which CRC-check their output) are green, and `make test` passes
+end to end. For the paths this touches, a differential harness compiled twice —
+against `upstream/lib/liblz4.a` and against `target/release/liblz4_rs.a` —
+compares prefix mode, `withPrefix64k`, partial-in-prefix mode, external dict,
+in-place-with-prefix, and four malformed inputs, over six PRNG seeds and four
+sizes: **270 transcript lines, byte-identical, including the negative return
+values.** Round-trip alone would not have caught the original defect (it
+crashed rather than mis-decoded), but rejection parity is the half that silently
+drifts, so the return codes are in the transcript too.
+
+---
+
 ## 9. Open items
 
 - [ ] **Build the Dockerfile once.** It was written on a host without Docker,
@@ -588,12 +638,9 @@ levels 1 and 2: **18 transcripts, all byte-identical** (`fuzz/driver.sh`).
 - [ ] Fill in `unimplemented!()` stubs (see §4); order of work in `PLAN.md` §6
 - [ ] **Frame contexts: move the working buffers into the caller's allocator**
       (§8.1). One `frametest` unit assertion depends on it.
-- [ ] **One live bug in `src/block.rs`, *outside* the HC work of §8.2:**
-      - Segfault in decompressor #5, `LZ4_decompress_safe_withPrefix64k`:
-        `./upstream/tests/fullbench -d5 -i1 upstream/tests/COPYING` dies, which
-        is what stops `make test` at `test-fullbench`. Present before the HC
-        work (confirmed by stashing it and rebuilding), so it is a phase-2/4
-        decode-path defect, not a regression.
+- [x] **Segfault in the prefix decode path — fixed (2026-08-02), see §8.3.**
+      Killed decompressors #5/#6/#8 in `fullbench` and stopped `make test` at
+      `test-fullbench`. `make test` now exits 0 end to end.
 - [ ] Differential fuzz harness (C reference vs Rust, valid **and** malformed input)
       — `fuzz/hc_difftest.c` covers the HC surface (§8.2); the generic block and
       malformed-input halves are still missing

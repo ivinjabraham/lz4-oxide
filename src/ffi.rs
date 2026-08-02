@@ -536,7 +536,6 @@ unsafe fn decompress_safe_histories(
     {
         return -1;
     }
-    let input = unsafe { slice::from_raw_parts(src.cast::<u8>(), compressed_size as usize) };
     let external = if external_size == 0 {
         &[][..]
     } else if external_address == 0 {
@@ -544,30 +543,62 @@ unsafe fn decompress_safe_histories(
     } else {
         unsafe { slice::from_raw_parts(external_address as *const u8, external_size) }
     };
-    let prefix = if prefix_size == 0 {
-        &[][..]
-    } else if prefix_address == 0 {
+    if prefix_size != 0 && prefix_address == 0 {
         return -1;
-    } else {
-        unsafe { slice::from_raw_parts(prefix_address as *const u8, prefix_size) }
-    };
-    let mut buffer = vec![0u8; prefix.len() + output_size as usize];
-    buffer[..prefix.len()].copy_from_slice(&prefix);
-    let start = prefix.len();
-    let end = buffer.len();
-    let result = decode_result(block::decompress_dict(
-        &mut buffer,
-        start..end,
-        &Input::Separate(input),
-        partial,
-        output_size as usize,
-        external,
-        prefix.len(),
-    ));
-    if result >= 0 && result != 0 {
-        unsafe { core::ptr::copy(buffer[start..].as_ptr(), dst.cast::<u8>(), result as usize) };
     }
-    result
+    // A prefix is *contiguous with* `dst` by definition — C selects this mode
+    // precisely when `dictStart + dictSize == dst` — so the history and the
+    // output are one buffer, and we address it as one: `buf` spans
+    // `[dst - prefix_size, dst + output_size)`, with the block at `prefix_size`.
+    //
+    // It must NOT be staged through a scratch copy. Copying the prefix in
+    // *reads* all `prefix_size` bytes up front, where C only ever reads the
+    // bytes a match actually reaches back to. `fullbench` relies on the
+    // difference: `local_LZ4_decompress_safe_withPrefix64k` passes
+    // `out = orig_buff`, the head of a `malloc`, so the nominal 64 KB before it
+    // is unmapped. C never touches it (the data was compressed without a
+    // dictionary, so no offset reaches below `dst`); the eager copy segfaulted.
+    let dst_offset = prefix_size;
+    let span_lo = (dst as usize) - prefix_size;
+    let span_hi = (dst as usize) + output_size as usize;
+    let src_lo = src as usize;
+    let src_hi = src_lo + compressed_size as usize;
+    let overlaps = compressed_size != 0 && output_size != 0 && src_lo < span_hi && span_lo < src_hi;
+
+    let run = |buf: &mut [u8], input: &Input<'_>, shift: usize| {
+        decode_result(block::decompress_dict(
+            buf,
+            shift + dst_offset..shift + dst_offset + output_size as usize,
+            input,
+            partial,
+            output_size as usize,
+            external,
+            prefix_size,
+        ))
+    };
+
+    if overlaps {
+        // In-place decompression: `src` lies inside the same allocation as the
+        // output (`LZ4_DECOMPRESS_INPLACE_BUFFER_SIZE`). Holding `&[u8]` and
+        // `&mut [u8]` over the same bytes is UB, so span both and index in.
+        let lo = span_lo.min(src_lo);
+        let hi = span_hi.max(src_hi);
+        let buf = unsafe { slice::from_raw_parts_mut(lo as *mut u8, hi - lo) };
+        let s = (src_lo - lo)..(src_hi - lo);
+        run(buf, &Input::Within(s), span_lo - lo)
+    } else {
+        let input = if compressed_size == 0 {
+            &[][..]
+        } else {
+            unsafe { slice::from_raw_parts(src.cast::<u8>(), compressed_size as usize) }
+        };
+        let buf = if span_hi == span_lo {
+            &mut [][..]
+        } else {
+            unsafe { slice::from_raw_parts_mut(span_lo as *mut u8, span_hi - span_lo) }
+        };
+        run(buf, &Input::Separate(input), 0)
+    }
 }
 
 unsafe fn decompress_safe_impl(
