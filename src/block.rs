@@ -187,6 +187,9 @@ enum DictDirective {
     WithPrefix64k,
     /// The dictionary lives in a separate allocation.
     UsingExtDict,
+    /// Hash candidates come from an attached dictionary stream until this
+    /// stream has populated its own table (lz4.c:1071-1084).
+    UsingDictCtx,
 }
 
 /// `dictIssue_directive` (lz4.c:752). `DictSmall` means the dictionary is
@@ -283,6 +286,36 @@ pub struct StreamState {
     tt: TableType,
 }
 
+/// Exact allocation-free mirror of `LZ4_stream_t_internal`.
+#[derive(Clone)]
+#[repr(C)]
+pub struct AbiStreamState {
+    pub hash_table: [u32; U32_ENTRIES],
+    pub dictionary: usize,
+    pub dict_ctx: usize,
+    pub current_offset: u32,
+    pub table_type: u32,
+    pub dict_size: u32,
+    pub padding: u32,
+}
+
+/// Exact allocation-free mirror of `LZ4_streamDecode_t_internal`.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct AbiDecodeState {
+    pub external_dict: usize,
+    pub prefix_end: usize,
+    pub ext_dict_size: usize,
+    pub prefix_size: usize,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<AbiStreamState>() == crate::types::LZ4_STREAM_SIZE);
+    assert!(core::mem::align_of::<AbiStreamState>() == crate::types::LZ4_STREAM_ALIGN);
+    assert!(core::mem::size_of::<AbiDecodeState>() == crate::types::LZ4_STREAMDECODE_SIZE);
+    assert!(core::mem::align_of::<AbiDecodeState>() == crate::types::LZ4_STREAMDECODE_ALIGN);
+};
+
 impl StreamState {
     pub fn new() -> Self {
         StreamState {
@@ -376,6 +409,95 @@ impl StreamState {
     }
 }
 
+impl AbiStreamState {
+    pub fn reset(&mut self) {
+        self.hash_table.fill(0);
+        self.dictionary = 0;
+        self.dict_ctx = 0;
+        self.current_offset = 0;
+        self.table_type = 0;
+        self.dict_size = 0;
+        self.padding = 0;
+    }
+
+    pub fn reset_fast(&mut self) {
+        if self.table_type != 0 && (self.table_type != 2 || self.current_offset > (1 << 30)) {
+            self.hash_table.fill(0);
+            self.current_offset = 0;
+            self.table_type = 0;
+        }
+        if self.current_offset != 0 {
+            self.current_offset = self.current_offset.wrapping_add(64 * 1024);
+        }
+        self.dictionary = 0;
+        self.dict_ctx = 0;
+        self.dict_size = 0;
+    }
+
+    pub fn renormalize(&mut self, next_size: usize) {
+        if self.current_offset as usize + next_size > 0x8000_0000 {
+            let delta = self.current_offset - 64 * 1024;
+            let dict_end = self.dictionary.saturating_add(self.dict_size as usize);
+            for entry in &mut self.hash_table {
+                *entry = if *entry < delta { 0 } else { *entry - delta };
+            }
+            self.current_offset = 64 * 1024;
+            self.dict_size = self.dict_size.min(64 * 1024);
+            self.dictionary = dict_end.saturating_sub(self.dict_size as usize);
+        }
+    }
+
+    pub fn load_dict(&mut self, dict: &[u8], slow: bool) -> usize {
+        self.reset();
+        let mut state = StreamState::new();
+        let result = state.load_dict(dict, slow);
+        self.store(&state);
+        result
+    }
+
+    fn working(&self) -> StreamState {
+        let tt = if self.table_type == 3 {
+            TableType::U16
+        } else {
+            TableType::U32
+        };
+        StreamState {
+            table: Table::from_abi(&self.hash_table, tt),
+            current_offset: self.current_offset,
+            dict_size: self.dict_size,
+            tt,
+        }
+    }
+
+    fn store(&mut self, state: &StreamState) {
+        state.table.store_abi(&mut self.hash_table);
+        self.current_offset = state.current_offset;
+        self.dict_size = state.dict_size;
+        self.table_type = if state.tt == TableType::U16 { 3 } else { 2 };
+    }
+
+    fn prepare(&mut self, input_size: usize, tt: TableType) {
+        let table_type = if tt == TableType::U16 { 3 } else { 2 };
+        if self.table_type != 0
+            && (self.table_type != table_type
+                || (tt == TableType::U16
+                    && self.current_offset as usize + input_size >= u16::MAX as usize)
+                || (tt == TableType::U32 && self.current_offset > (1 << 30))
+                || input_size >= 4 * 1024)
+        {
+            self.hash_table.fill(0);
+            self.current_offset = 0;
+            self.table_type = 0;
+        }
+        if self.current_offset != 0 && tt == TableType::U32 {
+            self.current_offset = self.current_offset.wrapping_add(64 * 1024);
+        }
+        self.dictionary = 0;
+        self.dict_ctx = 0;
+        self.dict_size = 0;
+    }
+}
+
 impl Default for StreamState {
     fn default() -> Self {
         Self::new()
@@ -396,8 +518,18 @@ impl Table {
         // a 2 MB array on the stack. C puts `LZ4_stream_t` on the stack
         // (lz4.c:1469) but its callers control the size; ours is a library.
         match tt {
-            TableType::U16 => Table::U16(vec![0u16; U16_ENTRIES].into_boxed_slice().try_into().unwrap()),
-            TableType::U32 => Table::U32(vec![0u32; U32_ENTRIES].into_boxed_slice().try_into().unwrap()),
+            TableType::U16 => Table::U16(
+                vec![0u16; U16_ENTRIES]
+                    .into_boxed_slice()
+                    .try_into()
+                    .unwrap(),
+            ),
+            TableType::U32 => Table::U32(
+                vec![0u32; U32_ENTRIES]
+                    .into_boxed_slice()
+                    .try_into()
+                    .unwrap(),
+            ),
         }
     }
 
@@ -424,6 +556,33 @@ impl Table {
         }
     }
 
+    fn from_abi(words: &[u32; U32_ENTRIES], tt: TableType) -> Self {
+        match tt {
+            TableType::U32 => Table::U32(Box::new(*words)),
+            TableType::U16 => {
+                let mut entries = Box::new([0u16; U16_ENTRIES]);
+                for (i, word) in words.iter().enumerate() {
+                    let bytes = word.to_ne_bytes();
+                    entries[2 * i] = u16::from_ne_bytes([bytes[0], bytes[1]]);
+                    entries[2 * i + 1] = u16::from_ne_bytes([bytes[2], bytes[3]]);
+                }
+                Table::U16(entries)
+            }
+        }
+    }
+
+    fn store_abi(&self, words: &mut [u32; U32_ENTRIES]) {
+        match self {
+            Table::U32(entries) => words.copy_from_slice(entries.as_slice()),
+            Table::U16(entries) => {
+                for (i, word) in words.iter_mut().enumerate() {
+                    let lo = entries[2 * i].to_ne_bytes();
+                    let hi = entries[2 * i + 1].to_ne_bytes();
+                    *word = u32::from_ne_bytes([lo[0], lo[1], hi[0], hi[1]]);
+                }
+            }
+        }
+    }
 }
 
 /// lz4.c:786.
@@ -440,7 +599,11 @@ fn hash4(sequence: u32, tt: TableType) -> u32 {
 /// lz4.c:794. Branches on host endianness internally, as C does.
 #[inline]
 fn hash5(sequence: u64, tt: TableType) -> u32 {
-    let hash_log = if tt == TableType::U16 { HASHLOG + 1 } else { HASHLOG };
+    let hash_log = if tt == TableType::U16 {
+        HASHLOG + 1
+    } else {
+        HASHLOG
+    };
     if cfg!(target_endian = "little") {
         const PRIME5BYTES: u64 = 889523592379;
         ((sequence << 24).wrapping_mul(PRIME5BYTES) >> (64 - hash_log)) as u32
@@ -514,10 +677,13 @@ fn compress_generic(
     input: &Input,
     state: &mut StreamState,
     dict_content: &[u8],
+    dict_context: Option<&StreamState>,
     directive: DictDirective,
     dict_issue: DictIssue,
     tt: TableType,
     limited: bool,
+    fill: bool,
+    consumed: &mut usize,
     acceleration: i32,
 ) -> Result<usize, Error> {
     let input_size = input.len();
@@ -543,10 +709,18 @@ fn compress_generic(
         start_index,
         dict_size: state.dict_size,
     };
+    let context_hist = dict_context.map(|context| Hist {
+        content: dict_content,
+        start_index,
+        dict_size: context.dict_size,
+    });
     // `prefixIdxLimit` (lz4.c:968): with DictSmall, candidates below this point
     // at content that is no longer present.
     let prefix_idx_limit = start_index - state.dict_size;
-    let maybe_ext_mem = directive == DictDirective::UsingExtDict;
+    let maybe_ext_mem = matches!(
+        directive,
+        DictDirective::UsingExtDict | DictDirective::UsingDictCtx
+    );
 
     state.dict_size += input_size as u32;
     state.current_offset += input_size as u32;
@@ -560,7 +734,9 @@ fn compress_generic(
 
     // lz4.c:1011 — too small to compress; everything becomes literals.
     if input_size < LZ4_MIN_LENGTH {
-        return last_literals(buf, input, anchor, iend, op, olimit, limited, dst.start);
+        return last_literals(
+            buf, input, anchor, iend, op, olimit, limited, fill, consumed, dst.start,
+        );
     }
 
     // Only computed past the guard above: below LZ4_MIN_LENGTH (13) both of
@@ -597,7 +773,7 @@ fn compress_generic(
             loop {
                 let h = forward_h;
                 let current = (forward_ip + start_index as usize) as u32;
-                let mi = table.get(h);
+                let mut mi = table.get(h);
                 ip = forward_ip;
                 forward_ip += step;
                 // Post-increment: the *old* counter picks the step (lz4.c:1062).
@@ -605,13 +781,25 @@ fn compress_generic(
                 search_match_nb += 1;
 
                 if forward_ip > mflimit_plus_one {
-                    return last_literals(buf, input, anchor, iend, op, olimit, limited, dst.start);
+                    return last_literals(
+                        buf, input, anchor, iend, op, olimit, limited, fill, consumed, dst.start,
+                    );
                 }
 
                 forward_h = hash_position(input, buf, forward_ip, tt);
                 table.put(h, current);
 
-                match_in_dict = directive == DictDirective::UsingExtDict && mi < start_index;
+                match_in_dict = matches!(
+                    directive,
+                    DictDirective::UsingExtDict | DictDirective::UsingDictCtx
+                ) && mi < start_index;
+                if directive == DictDirective::UsingDictCtx && match_in_dict {
+                    let context = dict_context.expect("dictionary context");
+                    mi = context
+                        .table
+                        .get(h)
+                        .wrapping_add(start_index.wrapping_sub(context.current_offset));
+                }
 
                 // lz4.c:1097 — a candidate pointing into content that the
                 // (short) dictionary no longer covers.
@@ -633,11 +821,16 @@ fn compress_generic(
                 // address inside the old buffer, and the `LZ4_DISTANCE_MAX`
                 // test above is what rejects it. Here the same entry would
                 // index outside `content`, so it is filtered explicitly.
-                if mi < hist.dict_base_index() {
+                let active_hist = if directive == DictDirective::UsingDictCtx && match_in_dict {
+                    context_hist.as_ref().expect("dictionary context")
+                } else {
+                    &hist
+                };
+                if mi < active_hist.dict_base_index() {
                     continue;
                 }
 
-                if hist.read32(input, buf, mi) == Some(input.u32_ne(buf, ip)) {
+                if active_hist.read32(input, buf, mi) == Some(input.u32_ne(buf, ip)) {
                     if maybe_ext_mem {
                         ext_offset = current - mi;
                     }
@@ -653,8 +846,14 @@ fn compress_generic(
         // block start otherwise, so the walk-back stops at a different place in
         // each case. It never crosses between the two regions, which is why a
         // single index comparison suffices.
+        let filled_ip = ip;
+        let active_hist = if directive == DictDirective::UsingDictCtx && match_in_dict {
+            context_hist.as_ref().expect("dictionary context")
+        } else {
+            &hist
+        };
         let low_limit: u32 = if match_in_dict {
-            hist.dict_base_index()
+            active_hist.dict_base_index()
         } else if directive == DictDirective::WithPrefix64k {
             start_index - hist.dict_size
         } else {
@@ -662,14 +861,14 @@ fn compress_generic(
         };
         let ip_index = |ip: usize| (ip + start_index as usize) as u32;
         if match_idx > low_limit
-            && input.byte(buf, ip - 1) == hist.byte(input, buf, match_idx - 1)
+            && input.byte(buf, ip - 1) == active_hist.byte(input, buf, match_idx - 1)
         {
             loop {
                 ip -= 1;
                 match_idx -= 1;
                 if !(ip_index(ip) > anchor as u32 + start_index
                     && match_idx > low_limit
-                    && input.byte(buf, ip - 1) == hist.byte(input, buf, match_idx - 1))
+                    && input.byte(buf, ip - 1) == active_hist.byte(input, buf, match_idx - 1))
                 {
                     break;
                 }
@@ -682,9 +881,17 @@ fn compress_generic(
             let lit_length = ip - anchor;
             op += 1;
             if limited
+                && !fill
                 && op + lit_length + (2 + 1 + LASTLITERALS) + (lit_length / 255) > olimit
             {
                 return Err(Error::OutputTooSmall);
+            }
+            if fill
+                && op + (lit_length + 240) / 255 + lit_length + 2 + 1 + MFLIMIT - MINMATCH > olimit
+            {
+                return last_literals(
+                    buf, input, anchor, iend, token, olimit, true, true, consumed, dst.start,
+                );
             }
             if lit_length >= RUN_MASK as usize {
                 let mut len = lit_length - RUN_MASK as usize;
@@ -706,6 +913,11 @@ fn compress_generic(
         // `_next_match` (lz4.c:1147). Re-entered without re-encoding literals
         // when the very next position also matches.
         loop {
+            if fill && op + 2 + 1 + MFLIMIT - MINMATCH > olimit {
+                return last_literals(
+                    buf, input, anchor, iend, token, olimit, true, true, consumed, dst.start,
+                );
+            }
             // --- Encode offset (lz4.c:1163-1172). Always little-endian. ---
             //
             // For an ext-dict match the distance is the index difference, which
@@ -731,8 +943,14 @@ fn compress_generic(
                     if limit > matchlimit {
                         limit = matchlimit;
                     }
-                    let mut mc =
-                        count_hist(input, buf, &hist, ip + MINMATCH, match_idx + MINMATCH as u32, limit);
+                    let mut mc = count_hist(
+                        input,
+                        buf,
+                        active_hist,
+                        ip + MINMATCH,
+                        match_idx + MINMATCH as u32,
+                        limit,
+                    );
                     ip += mc + MINMATCH;
                     if ip == limit {
                         let more = count(input, buf, limit, 0, matchlimit);
@@ -744,14 +962,32 @@ fn compress_generic(
                     // Prefix mode reaches here with `match_idx < start_index`:
                     // the prefix and the block are one contiguous segment in C,
                     // so the count simply walks across the boundary.
-                    let mc =
-                        count_hist(input, buf, &hist, ip + MINMATCH, match_idx + MINMATCH as u32, matchlimit);
+                    let mc = count_hist(
+                        input,
+                        buf,
+                        active_hist,
+                        ip + MINMATCH,
+                        match_idx + MINMATCH as u32,
+                        matchlimit,
+                    );
                     ip += mc + MINMATCH;
                     mc
                 };
 
                 if limited && op + (1 + LASTLITERALS) + (match_code + 240) / 255 > olimit {
-                    return Err(Error::OutputTooSmall);
+                    if !fill {
+                        return Err(Error::OutputTooSmall);
+                    }
+                    let new_match_code = 14 + (olimit - op - 1 - LASTLITERALS) * 255;
+                    ip -= match_code - new_match_code;
+                    match_code = new_match_code;
+                    if ip <= filled_ip {
+                        for position in ip..=filled_ip {
+                            if position + 8 <= input.len() {
+                                table.put(hash_position(input, buf, position, tt), 0);
+                            }
+                        }
+                    }
                 }
                 if match_code >= ML_MASK as usize {
                     buf[token] += ML_MASK as u8;
@@ -782,21 +1018,36 @@ fn compress_generic(
             // --- Test next position (lz4.c:1262-1303) ---
             let h = hash_position(input, buf, ip, tt);
             let current = ip_index(ip);
-            let mi = table.get(h);
+            let mut mi = table.get(h);
             table.put(h, current);
 
-            let in_dict = directive == DictDirective::UsingExtDict && mi < start_index;
-            let near_enough = if tt == TableType::U16 && LZ4_DISTANCE_MAX == LZ4_DISTANCE_ABSOLUTE_MAX
-            {
-                true
+            let in_dict = matches!(
+                directive,
+                DictDirective::UsingExtDict | DictDirective::UsingDictCtx
+            ) && mi < start_index;
+            if directive == DictDirective::UsingDictCtx && in_dict {
+                let context = dict_context.expect("dictionary context");
+                mi = context
+                    .table
+                    .get(h)
+                    .wrapping_add(start_index.wrapping_sub(context.current_offset));
+            }
+            let next_hist = if directive == DictDirective::UsingDictCtx && in_dict {
+                context_hist.as_ref().expect("dictionary context")
             } else {
-                (mi as usize) + LZ4_DISTANCE_MAX >= current as usize
+                &hist
             };
+            let near_enough =
+                if tt == TableType::U16 && LZ4_DISTANCE_MAX == LZ4_DISTANCE_ABSOLUTE_MAX {
+                    true
+                } else {
+                    (mi as usize) + LZ4_DISTANCE_MAX >= current as usize
+                };
             let dict_ok = dict_issue != DictIssue::DictSmall || mi >= prefix_idx_limit;
             if dict_ok
                 && near_enough
-                && mi >= hist.dict_base_index()
-                && hist.read32(input, buf, mi) == Some(input.u32_ne(buf, ip))
+                && mi >= next_hist.dict_base_index()
+                && next_hist.read32(input, buf, mi) == Some(input.u32_ne(buf, ip))
             {
                 token = op;
                 buf[token] = 0;
@@ -816,7 +1067,9 @@ fn compress_generic(
         }
     }
 
-    last_literals(buf, input, anchor, iend, op, olimit, limited, dst.start)
+    last_literals(
+        buf, input, anchor, iend, op, olimit, limited, fill, consumed, dst.start,
+    )
 }
 
 /// `_last_literals` (lz4.c:1311-1338).
@@ -829,11 +1082,17 @@ fn last_literals(
     mut op: usize,
     olimit: usize,
     limited: bool,
+    fill: bool,
+    consumed: &mut usize,
     dst_start: usize,
 ) -> Result<usize, Error> {
-    let last_run = iend - anchor;
+    let mut last_run = iend - anchor;
     if limited && op + last_run + 1 + ((last_run + 255 - RUN_MASK as usize) / 255) > olimit {
-        return Err(Error::OutputTooSmall);
+        if !fill || olimit <= op {
+            return Err(Error::OutputTooSmall);
+        }
+        last_run = olimit - op - 1;
+        last_run -= (last_run + 256 - RUN_MASK as usize) / 256;
     }
     if last_run >= RUN_MASK as usize {
         let mut accumulator = last_run - RUN_MASK as usize;
@@ -852,6 +1111,9 @@ fn last_literals(
     }
     input.copy_to(buf, anchor, op, last_run);
     op += last_run;
+    if fill {
+        *consumed = anchor + last_run;
+    }
     Ok(op - dst_start)
 }
 
@@ -889,18 +1151,62 @@ pub fn compress_fast(
         dict_size: 0,
         tt,
     };
+    let mut consumed = 0;
     compress_generic(
         buf,
         dst,
         input,
         &mut state,
         &[],
+        None,
         DictDirective::NoDict,
         DictIssue::NoDictIssue,
         tt,
         limited,
+        false,
+        &mut consumed,
         acceleration,
     )
+}
+
+/// `LZ4_compress_destSize`: fill the output and report the consumed prefix.
+pub fn compress_dest_size(
+    buf: &mut [u8],
+    dst: Range<usize>,
+    input: &Input,
+    acceleration: i32,
+) -> Result<(usize, usize), Error> {
+    if dst.is_empty() {
+        return Err(Error::OutputTooSmall);
+    }
+    let tt = if input.len() < LZ4_64K_LIMIT {
+        TableType::U16
+    } else {
+        TableType::U32
+    };
+    let mut state = StreamState {
+        table: Table::new(tt),
+        current_offset: 0,
+        dict_size: 0,
+        tt,
+    };
+    let mut consumed = 0;
+    let written = compress_generic(
+        buf,
+        dst,
+        input,
+        &mut state,
+        &[],
+        None,
+        DictDirective::NoDict,
+        DictIssue::NoDictIssue,
+        tt,
+        true,
+        true,
+        &mut consumed,
+        acceleration.clamp(LZ4_ACCELERATION_DEFAULT, LZ4_ACCELERATION_MAX),
+    )?;
+    Ok((written, consumed))
 }
 
 /// `LZ4_compress_fast_continue` (lz4.c:1716) — one block of a linked stream.
@@ -920,6 +1226,7 @@ pub fn compress_continue(
     state: &mut StreamState,
     dict: &[u8],
     prefix: bool,
+    dict_context: Option<&StreamState>,
     acceleration: i32,
 ) -> Result<usize, Error> {
     let mut acceleration = acceleration;
@@ -941,33 +1248,124 @@ pub fn compress_continue(
     let dst_capacity = dst.end - dst.start;
     let _ = dst_capacity;
 
-    let (directive, issue) = if prefix {
+    let (directive, issue) = if dict_context.is_some() {
+        (DictDirective::UsingDictCtx, DictIssue::NoDictIssue)
+    } else if prefix {
         // lz4.c:1755-1759
-        let issue = if (state.dict_size as usize) < 64 * 1024
-            && state.dict_size < state.current_offset
-        {
-            DictIssue::DictSmall
-        } else {
-            DictIssue::NoDictIssue
-        };
+        let issue =
+            if (state.dict_size as usize) < 64 * 1024 && state.dict_size < state.current_offset {
+                DictIssue::DictSmall
+            } else {
+                DictIssue::NoDictIssue
+            };
         (DictDirective::WithPrefix64k, issue)
     } else {
         // lz4.c:1781-1786
-        let issue = if (state.dict_size as usize) < 64 * 1024
-            && state.dict_size < state.current_offset
-        {
-            DictIssue::DictSmall
-        } else {
-            DictIssue::NoDictIssue
-        };
+        let issue =
+            if (state.dict_size as usize) < 64 * 1024 && state.dict_size < state.current_offset {
+                DictIssue::DictSmall
+            } else {
+                DictIssue::NoDictIssue
+            };
         (DictDirective::UsingExtDict, issue)
     };
 
     // C always uses `limitedOutput` here (lz4.c:1757) — a streaming caller's
     // dstCapacity is never assumed to cover the bound.
+    if directive == DictDirective::UsingDictCtx {
+        state.dict_size = 0;
+    }
+    let mut consumed = 0;
     compress_generic(
-        buf, dst, input, state, dict, directive, issue, tt, true, acceleration,
+        buf,
+        dst,
+        input,
+        state,
+        dict,
+        dict_context,
+        directive,
+        issue,
+        tt,
+        true,
+        false,
+        &mut consumed,
+        acceleration,
     )
+}
+
+/// Adapt caller-owned ABI state to the Phase 3 streaming compressor.
+#[allow(clippy::too_many_arguments)]
+pub fn compress_abi_continue(
+    buf: &mut [u8],
+    dst: Range<usize>,
+    input: &Input,
+    state: &mut AbiStreamState,
+    dict: &[u8],
+    prefix: bool,
+    dict_context: Option<(&AbiStreamState, &[u8])>,
+    acceleration: i32,
+) -> Result<usize, Error> {
+    let mut working = state.working();
+    let context = dict_context.map(|(context, _)| context.working());
+    let context_dict = dict_context.map_or(dict, |(_, content)| content);
+    let result = compress_continue(
+        buf,
+        dst,
+        input,
+        &mut working,
+        context_dict,
+        prefix,
+        context.as_ref(),
+        acceleration,
+    );
+    state.store(&working);
+    result
+}
+
+/// One-shot compression using caller-provided `LZ4_stream_t` storage.
+pub fn compress_abi_ext_state(
+    buf: &mut [u8],
+    dst: Range<usize>,
+    input: &Input,
+    state: &mut AbiStreamState,
+    acceleration: i32,
+    fast_reset: bool,
+) -> Result<usize, Error> {
+    let tt = if input.len() < LZ4_64K_LIMIT {
+        TableType::U16
+    } else {
+        TableType::U32
+    };
+    if fast_reset {
+        state.prepare(input.len(), tt);
+    } else {
+        state.reset();
+    }
+    let mut working = StreamState {
+        table: Table::from_abi(&state.hash_table, tt),
+        current_offset: state.current_offset,
+        dict_size: state.dict_size,
+        tt,
+    };
+    let limited = dst.end - dst.start < compress_bound(input.len() as i32) as usize;
+    let mut consumed = 0;
+    let result = compress_generic(
+        buf,
+        dst,
+        input,
+        &mut working,
+        &[],
+        None,
+        DictDirective::NoDict,
+        DictIssue::NoDictIssue,
+        tt,
+        limited,
+        false,
+        &mut consumed,
+        acceleration.clamp(LZ4_ACCELERATION_DEFAULT, LZ4_ACCELERATION_MAX),
+    );
+    state.store(&working);
+    result
 }
 
 // ===========================================================================
@@ -1044,7 +1442,7 @@ pub fn decompress_dict(
     // `dictSize` (lz4.c:2032) — the ext dict's length, or the prefix's, since
     // both are "history that precedes the block". Only the ext-dict case can
     // reach outside `buf`.
-    let dict_size = if using_ext { ext_dict.len() } else { prefix_size };
+    let dict_size = ext_dict.len() + prefix_size;
     // lz4.c:2046 — with a full 64 KB of history the offset can't escape it, so
     // C skips the check entirely. Reproduced because it decides what is
     // *rejected*, and rejection parity is half of behavioural equivalence.
@@ -1111,7 +1509,8 @@ pub fn decompress_dict(
             // legitimate here and this stage still applies.
             if match_len != ML_MASK as usize
                 && offset >= 8
-                && (prefix_size >= 64 * 1024 || op as isize - offset as isize >= low_prefix as isize)
+                && (prefix_size >= 64 * 1024
+                    || op as isize - offset as isize >= low_prefix as isize)
             {
                 copy_match(buf, op, op - offset, match_len + MINMATCH);
                 op += match_len + MINMATCH;
@@ -1294,6 +1693,85 @@ pub fn decompress_dict(
     Ok(op - dst_start)
 }
 
+/// Legacy output-size-driven decoder. The source has no declared length, so
+/// the FFI layer supplies a byte reader rather than manufacturing a slice.
+pub fn decompress_fast_with(
+    mut byte: impl FnMut(usize) -> u8,
+    output: &mut [u8],
+    external: &[u8],
+    prefix: &[u8],
+) -> Result<usize, Error> {
+    let mut ip = 0usize;
+    let mut op = 0usize;
+    loop {
+        let token = byte(ip) as usize;
+        ip += 1;
+        let mut literal_length = token >> ML_BITS;
+        if literal_length == RUN_MASK as usize {
+            loop {
+                let extension = byte(ip) as usize;
+                ip += 1;
+                literal_length += extension;
+                if extension != 255 {
+                    break;
+                }
+            }
+        }
+        if output.len() - op < literal_length {
+            return Err(Error::Malformed { consumed: ip });
+        }
+        for index in 0..literal_length {
+            output[op + index] = byte(ip + index);
+        }
+        ip += literal_length;
+        op += literal_length;
+        if output.len() - op < MFLIMIT {
+            return if op == output.len() {
+                Ok(ip)
+            } else {
+                Err(Error::Malformed { consumed: ip })
+            };
+        }
+
+        let offset = u16::from_le_bytes([byte(ip), byte(ip + 1)]) as usize;
+        ip += 2;
+        let mut match_length = token & ML_MASK as usize;
+        if match_length == ML_MASK as usize {
+            loop {
+                let extension = byte(ip) as usize;
+                ip += 1;
+                match_length += extension;
+                if extension != 255 {
+                    break;
+                }
+            }
+        }
+        match_length += MINMATCH;
+        let history_len = external.len() + prefix.len();
+        if output.len() - op < match_length || offset > history_len + op {
+            return Err(Error::Malformed { consumed: ip });
+        }
+        if offset == 0 {
+            output[op..op + match_length].fill(0);
+        } else {
+            for index in 0..match_length {
+                let source = history_len + op - offset + index;
+                output[op + index] = if source < external.len() {
+                    external[source]
+                } else if source < history_len {
+                    prefix[source - external.len()]
+                } else {
+                    output[source - history_len]
+                };
+            }
+        }
+        op += match_length;
+        if output.len() - op < LASTLITERALS {
+            return Err(Error::Malformed { consumed: ip });
+        }
+    }
+}
+
 /// The overlapping match copy — **byte at a time, on purpose**.
 ///
 /// Nothing requires `offset >= length`. When `offset < length` the source and
@@ -1309,5 +1787,57 @@ pub fn decompress_dict(
 fn copy_match(buf: &mut [u8], dst_at: usize, match_at: usize, len: usize) {
     for i in 0..len {
         buf[dst_at + i] = buf[match_at + i];
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    fn abi_state() -> AbiStreamState {
+        AbiStreamState {
+            hash_table: [0; U32_ENTRIES],
+            dictionary: 0,
+            dict_ctx: 0,
+            current_offset: 0,
+            table_type: 0,
+            dict_size: 0,
+            padding: 0,
+        }
+    }
+
+    #[test]
+    fn abi_stream_layouts_match_c() {
+        assert_eq!(
+            core::mem::size_of::<AbiStreamState>(),
+            crate::types::LZ4_STREAM_SIZE
+        );
+        assert_eq!(
+            core::mem::align_of::<AbiStreamState>(),
+            crate::types::LZ4_STREAM_ALIGN
+        );
+        assert_eq!(
+            core::mem::size_of::<AbiDecodeState>(),
+            crate::types::LZ4_STREAMDECODE_SIZE
+        );
+        assert_eq!(
+            core::mem::align_of::<AbiDecodeState>(),
+            crate::types::LZ4_STREAMDECODE_ALIGN
+        );
+    }
+
+    #[test]
+    fn abi_stream_renormalization_rescales_indices() {
+        let mut state = abi_state();
+        state.current_offset = 0x7fff_ffff;
+        state.dictionary = 100_000;
+        state.dict_size = 70_000;
+        let delta = state.current_offset - 64 * 1024;
+        state.hash_table[..3].copy_from_slice(&[delta - 1, delta, state.current_offset - 1]);
+        state.renormalize(2);
+        assert_eq!(state.current_offset, 64 * 1024);
+        assert_eq!(state.dict_size, 64 * 1024);
+        assert_eq!(state.dictionary, 104_464);
+        assert_eq!(&state.hash_table[..3], &[0, 0, 65_535]);
     }
 }

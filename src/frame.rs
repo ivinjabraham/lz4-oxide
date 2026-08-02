@@ -549,6 +549,7 @@ impl Cctx {
                         &mut self.stream,
                         &dict,
                         true,
+                        None,
                         accel,
                     );
                     self.dict = dict;
@@ -571,6 +572,7 @@ impl Cctx {
                         &mut self.stream,
                         &dict,
                         false,
+                        None,
                         accel,
                     );
                     self.frame_dict = dict;

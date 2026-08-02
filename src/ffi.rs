@@ -10,13 +10,15 @@
 // is still `unimplemented!()` panics with its own symbol name.
 #![allow(non_snake_case, unused_variables, dead_code, unused_imports)]
 
-use core::ffi::{c_char, c_double, c_float, c_int, c_long, c_longlong,
-                c_schar, c_short, c_uchar, c_uint, c_ulong, c_ulonglong,
-                c_ushort, c_void};
+use core::ffi::{
+    c_char, c_double, c_float, c_int, c_long, c_longlong, c_schar, c_short, c_uchar, c_uint,
+    c_ulong, c_ulonglong, c_ushort, c_void,
+};
 
 use crate::types::*;
 
 use crate::block::{self, Error as BlockError, Input};
+use crate::block::{AbiDecodeState, AbiStreamState};
 use core::ops::Range;
 use core::slice;
 
@@ -73,6 +75,450 @@ unsafe fn with_buffers<R>(
     }
 }
 
+#[inline]
+fn ranges_overlap(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+    a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+}
+
+fn abi_stream_ptr(stream: *mut LZ4_stream_t) -> Option<core::ptr::NonNull<AbiStreamState>> {
+    if stream.is_null() || stream as usize % core::mem::align_of::<AbiStreamState>() != 0 {
+        None
+    } else {
+        core::ptr::NonNull::new(stream.cast::<AbiStreamState>())
+    }
+}
+
+fn abi_decode_ptr(stream: *mut LZ4_streamDecode_t) -> Option<core::ptr::NonNull<AbiDecodeState>> {
+    if stream.is_null() || stream as usize % core::mem::align_of::<AbiDecodeState>() != 0 {
+        None
+    } else {
+        core::ptr::NonNull::new(stream.cast::<AbiDecodeState>())
+    }
+}
+
+unsafe fn compress_ext_state_impl(
+    state: *mut c_void,
+    src: *const c_char,
+    dst: *mut c_char,
+    src_size: c_int,
+    dst_capacity: c_int,
+    acceleration: c_int,
+    fast_reset: bool,
+) -> c_int {
+    if state.is_null()
+        || state as usize % core::mem::align_of::<AbiStreamState>() != 0
+        || src_size < 0
+        || dst_capacity < 0
+        || (src_size != 0 && src.is_null())
+        || dst.is_null()
+        || ranges_overlap(
+            state as usize,
+            core::mem::size_of::<AbiStreamState>(),
+            dst as usize,
+            dst_capacity as usize,
+        )
+    {
+        return 0;
+    }
+    let state_size = core::mem::size_of::<AbiStreamState>();
+    let source_snapshot =
+        ranges_overlap(state as usize, state_size, src as usize, src_size as usize).then(
+            || unsafe { slice::from_raw_parts(src.cast::<u8>(), src_size as usize).to_vec() },
+        );
+    let state = unsafe { &mut *state.cast::<AbiStreamState>() };
+    if let Some(source) = source_snapshot.as_deref() {
+        let output = unsafe { slice::from_raw_parts_mut(dst.cast::<u8>(), dst_capacity as usize) };
+        return block::compress_abi_ext_state(
+            output,
+            0..output.len(),
+            &Input::Separate(source),
+            state,
+            acceleration,
+            fast_reset,
+        )
+        .unwrap_or(0) as c_int;
+    }
+    unsafe {
+        with_buffers(
+            src,
+            src_size as usize,
+            dst,
+            dst_capacity as usize,
+            |buf, range, input| {
+                block::compress_abi_ext_state(buf, range, input, state, acceleration, fast_reset)
+                    .unwrap_or(0) as c_int
+            },
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn compress_continue_impl(
+    stream: *mut LZ4_stream_t,
+    src: *const c_char,
+    dst: *mut c_char,
+    src_size: c_int,
+    dst_capacity: c_int,
+    acceleration: c_int,
+    force_external: bool,
+) -> c_int {
+    if src_size < 0
+        || dst_capacity <= 0
+        || (src_size != 0 && src.is_null())
+        || dst.is_null()
+        || stream.is_null()
+        || stream as usize % core::mem::align_of::<AbiStreamState>() != 0
+    {
+        return 0;
+    }
+    let src_size = src_size as usize;
+    let dst_capacity = dst_capacity as usize;
+    let context_address = unsafe {
+        core::ptr::addr_of!((*stream.cast::<AbiStreamState>()).dict_ctx).read()
+    };
+    let context = if context_address == 0 {
+        None
+    } else {
+        Some(unsafe { (&*(context_address as *const AbiStreamState)).clone() })
+    };
+    let state = unsafe { &mut *stream.cast::<AbiStreamState>() };
+    state.renormalize(src_size);
+
+    let mut dict_end = state.dictionary.saturating_add(state.dict_size as usize);
+    if state.dict_size < 4 && dict_end != src as usize && src_size != 0 && context.is_none() {
+        state.dict_size = 0;
+        state.dictionary = src as usize;
+        dict_end = src as usize;
+    }
+    let source_end = (src as usize).saturating_add(src_size);
+    if source_end > state.dictionary && source_end < dict_end {
+        state.dict_size = (dict_end - source_end).min(64 * 1024) as u32;
+        if state.dict_size < 4 {
+            state.dict_size = 0;
+        }
+        state.dictionary = dict_end - state.dict_size as usize;
+        dict_end = state.dictionary + state.dict_size as usize;
+    }
+
+    let prefix = !force_external && dict_end == src as usize;
+    let mut context = if prefix { None } else { context };
+    if context.is_some() && src_size > 4 * 1024 {
+        *state = context.take().unwrap();
+    }
+    let (dictionary_address, dictionary_size) = if let Some(context) = context.as_ref() {
+        (context.dictionary, context.dict_size as usize)
+    } else {
+        (state.dictionary, state.dict_size as usize)
+    };
+    let dictionary_snapshot = ranges_overlap(
+        dictionary_address,
+        dictionary_size,
+        dst as usize,
+        dst_capacity,
+    )
+    .then(|| unsafe {
+        slice::from_raw_parts(dictionary_address as *const u8, dictionary_size).to_vec()
+    });
+    let dictionary = dictionary_snapshot.as_deref().unwrap_or_else(|| unsafe {
+        slice::from_raw_parts(
+            if dictionary_size == 0 {
+                core::ptr::NonNull::<u8>::dangling().as_ptr()
+            } else {
+                dictionary_address as *const u8
+            },
+            dictionary_size,
+        )
+    });
+    let context_arg = context.as_ref().map(|context| (context, dictionary));
+    if context_arg.is_some() {
+        state.dict_ctx = 0;
+    }
+    let result = unsafe {
+        with_buffers(src, src_size, dst, dst_capacity, |buf, range, input| {
+            block::compress_abi_continue(
+                buf,
+                range,
+                input,
+                state,
+                dictionary,
+                prefix,
+                context_arg,
+                acceleration,
+            )
+            .unwrap_or(0)
+        })
+    };
+    if !prefix {
+        state.dictionary = src as usize;
+        state.dict_size = src_size as u32;
+    }
+    result as c_int
+}
+
+unsafe fn load_dict_impl(
+    stream: *mut LZ4_stream_t,
+    dictionary: *const c_char,
+    dict_size: c_int,
+    slow: bool,
+) -> c_int {
+    let Some(mut state) = abi_stream_ptr(stream) else {
+        return 0;
+    };
+    let state = unsafe { state.as_mut() };
+    if dict_size < 0 || (dict_size != 0 && dictionary.is_null()) {
+        state.reset();
+        return 0;
+    }
+    let original_size = dict_size as usize;
+    let retained_size = original_size.min(64 * 1024);
+    let retained = if retained_size == 0 {
+        &[]
+    } else {
+        unsafe {
+            slice::from_raw_parts(
+                dictionary.cast::<u8>().add(original_size - retained_size),
+                retained_size,
+            )
+        }
+    };
+    let loaded = state.load_dict(retained, slow);
+    if loaded != 0 {
+        state.dictionary = dictionary as usize + original_size - loaded;
+    }
+    loaded as c_int
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn decompress_safe_histories(
+    src: *const c_char,
+    dst: *mut c_char,
+    compressed_size: c_int,
+    output_size: c_int,
+    external_address: usize,
+    external_size: usize,
+    prefix_address: usize,
+    prefix_size: usize,
+    partial: bool,
+) -> c_int {
+    if src.is_null()
+        || compressed_size < 0
+        || output_size < 0
+        || (output_size != 0 && dst.is_null())
+    {
+        return -1;
+    }
+    let input = unsafe { slice::from_raw_parts(src.cast::<u8>(), compressed_size as usize) };
+    let external = if external_size == 0 {
+        &[][..]
+    } else if external_address == 0 {
+        return -1;
+    } else {
+        unsafe { slice::from_raw_parts(external_address as *const u8, external_size) }
+    };
+    let prefix = if prefix_size == 0 {
+        &[][..]
+    } else if prefix_address == 0 {
+        return -1;
+    } else {
+        unsafe { slice::from_raw_parts(prefix_address as *const u8, prefix_size) }
+    };
+    let mut buffer = vec![0u8; prefix.len() + output_size as usize];
+    buffer[..prefix.len()].copy_from_slice(&prefix);
+    let start = prefix.len();
+    let end = buffer.len();
+    let result = decode_result(block::decompress_dict(
+        &mut buffer,
+        start..end,
+        &Input::Separate(input),
+        partial,
+        output_size as usize,
+        external,
+        prefix.len(),
+    ));
+    if result >= 0 && result != 0 {
+        unsafe { core::ptr::copy(buffer[start..].as_ptr(), dst.cast::<u8>(), result as usize) };
+    }
+    result
+}
+
+unsafe fn decompress_safe_impl(
+    src: *const c_char,
+    dst: *mut c_char,
+    compressed_size: c_int,
+    output_size: c_int,
+    dictionary: Option<(*const c_char, usize)>,
+    external: bool,
+    partial: bool,
+) -> c_int {
+    let (address, size) = dictionary.map_or((0, 0), |(pointer, size)| (pointer as usize, size));
+    let (external_address, external_size, prefix_address, prefix_size) = if external {
+        (address, size, 0, 0)
+    } else {
+        (0, 0, address, size)
+    };
+    unsafe {
+        decompress_safe_histories(
+            src,
+            dst,
+            compressed_size,
+            output_size,
+            external_address,
+            external_size,
+            prefix_address,
+            prefix_size,
+            partial,
+        )
+    }
+}
+
+unsafe fn decompress_safe_continue_impl(
+    stream: *mut LZ4_streamDecode_t,
+    src: *const c_char,
+    dst: *mut c_char,
+    compressed_size: c_int,
+    output_size: c_int,
+) -> c_int {
+    let Some(mut state) = abi_decode_ptr(stream) else {
+        return -1;
+    };
+    let state = unsafe { state.as_mut() };
+    let contiguous = state.prefix_size != 0 && state.prefix_end == dst as usize;
+    if state.prefix_size != 0 && !contiguous {
+        state.ext_dict_size = state.prefix_size;
+        state.external_dict = state.prefix_end - state.prefix_size;
+    }
+    let (external_address, external_size, prefix_address, prefix_size) = if state.prefix_size == 0 {
+        (0, 0, 0, 0)
+    } else if contiguous && state.prefix_size >= 64 * 1024 - 1 {
+        let prefix_size = state.prefix_size.min(64 * 1024);
+        (0, 0, state.prefix_end - prefix_size, prefix_size)
+    } else if contiguous {
+        (
+            state.external_dict,
+            state.ext_dict_size,
+            state.prefix_end - state.prefix_size,
+            state.prefix_size,
+        )
+    } else {
+        (state.external_dict, state.ext_dict_size, 0, 0)
+    };
+    let result = unsafe {
+        decompress_safe_histories(
+            src,
+            dst,
+            compressed_size,
+            output_size,
+            external_address,
+            external_size,
+            prefix_address,
+            prefix_size,
+            false,
+        )
+    };
+    if result <= 0 {
+        return result;
+    }
+    if state.prefix_size == 0 || !contiguous {
+        state.prefix_size = result as usize;
+        state.prefix_end = dst as usize + result as usize;
+    } else {
+        state.prefix_size += result as usize;
+        state.prefix_end += result as usize;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn decompress_fast_impl(
+    src: *const c_char,
+    dst: *mut c_char,
+    output_size: c_int,
+    external_address: usize,
+    external_size: usize,
+    prefix_address: usize,
+    prefix_size: usize,
+) -> c_int {
+    if src.is_null() || output_size < 0 || (output_size != 0 && dst.is_null()) {
+        return -1;
+    }
+    let external = if external_size == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(external_address as *const u8, external_size) }
+    };
+    let prefix = if prefix_size == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(prefix_address as *const u8, prefix_size) }
+    };
+    let mut output = vec![0u8; output_size as usize];
+    match block::decompress_fast_with(
+        |index| unsafe { *src.cast::<u8>().add(index) },
+        &mut output,
+        external,
+        prefix,
+    ) {
+        Ok(consumed) => {
+            if !output.is_empty() {
+                unsafe { core::ptr::copy(output.as_ptr(), dst.cast::<u8>(), output.len()) };
+            }
+            consumed as c_int
+        }
+        Err(_) => -1,
+    }
+}
+
+unsafe fn decompress_fast_continue_impl(
+    stream: *mut LZ4_streamDecode_t,
+    src: *const c_char,
+    dst: *mut c_char,
+    output_size: c_int,
+) -> c_int {
+    let Some(mut state) = abi_decode_ptr(stream) else {
+        return -1;
+    };
+    let state = unsafe { state.as_mut() };
+    let contiguous = state.prefix_size != 0 && state.prefix_end == dst as usize;
+    if state.prefix_size != 0 && !contiguous {
+        state.ext_dict_size = state.prefix_size;
+        state.external_dict = state.prefix_end - state.prefix_size;
+    }
+    let (external_address, external_size, prefix_address, prefix_size) = if state.prefix_size == 0 {
+        (0, 0, 0, 0)
+    } else if contiguous {
+        (
+            state.external_dict,
+            state.ext_dict_size,
+            state.prefix_end - state.prefix_size,
+            state.prefix_size,
+        )
+    } else {
+        (state.external_dict, state.ext_dict_size, 0, 0)
+    };
+    let result = unsafe {
+        decompress_fast_impl(
+            src,
+            dst,
+            output_size,
+            external_address,
+            external_size,
+            prefix_address,
+            prefix_size,
+        )
+    };
+    if result <= 0 {
+        return result;
+    }
+    if state.prefix_size == 0 || !contiguous {
+        state.prefix_size = output_size as usize;
+        state.prefix_end = dst as usize + output_size as usize;
+    } else {
+        state.prefix_size += output_size as usize;
+        state.prefix_end += output_size as usize;
+    }
+    result
+}
+
 /// `Result` in, C integer convention out — done once, per function, because
 /// the conventions differ between families (DECISIONS.md §7.1).
 #[inline]
@@ -84,7 +530,6 @@ fn decode_result(r: Result<usize, BlockError>) -> c_int {
         Err(BlockError::OutputTooSmall) => -1,
     }
 }
-
 
 // ===========================================================================
 // Frame format (lib/lz4frame.c)
@@ -100,7 +545,6 @@ fn decode_result(r: Result<usize, BlockError>) -> c_int {
 // `frame::Error::to_code` is the single place that encoding is produced.
 
 use crate::frame::{self, BlockCompressMode, CDict, Cctx, Dctx, FrameInfo, Preferences};
-
 
 // --- Custom allocators -----------------------------------------------------
 //
@@ -298,13 +742,24 @@ pub unsafe extern "C" fn LZ4F_cctx_size(cctx: *const LZ4F_cctx) -> usize {
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_compressBegin(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, prefsPtr: *const LZ4F_preferences_t) -> usize {
+pub unsafe extern "C" fn LZ4F_compressBegin(
+    cctx: *mut LZ4F_cctx,
+    dstBuffer: *mut c_void,
+    dstCapacity: usize,
+    prefsPtr: *const LZ4F_preferences_t,
+) -> usize {
     LZ4F_compressBegin_usingDict(cctx, dstBuffer, dstCapacity, core::ptr::null(), 0, prefsPtr)
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_compressBegin_usingCDict(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, cdict: *const LZ4F_CDict, prefsPtr: *const LZ4F_preferences_t) -> usize {
+pub unsafe extern "C" fn LZ4F_compressBegin_usingCDict(
+    cctx: *mut LZ4F_cctx,
+    dstBuffer: *mut c_void,
+    dstCapacity: usize,
+    cdict: *const LZ4F_CDict,
+    prefsPtr: *const LZ4F_preferences_t,
+) -> usize {
     if cctx.is_null() {
         return frame::Error::ParameterNull.to_code();
     }
@@ -321,7 +776,14 @@ pub unsafe extern "C" fn LZ4F_compressBegin_usingCDict(cctx: *mut LZ4F_cctx, dst
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_compressBegin_usingDict(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, dictBuffer: *const c_void, dictSize: usize, prefsPtr: *const LZ4F_preferences_t) -> usize {
+pub unsafe extern "C" fn LZ4F_compressBegin_usingDict(
+    cctx: *mut LZ4F_cctx,
+    dstBuffer: *mut c_void,
+    dstCapacity: usize,
+    dictBuffer: *const c_void,
+    dictSize: usize,
+    prefsPtr: *const LZ4F_preferences_t,
+) -> usize {
     if cctx.is_null() {
         return frame::Error::ParameterNull.to_code();
     }
@@ -338,14 +800,22 @@ pub unsafe extern "C" fn LZ4F_compressBegin_usingDict(cctx: *mut LZ4F_cctx, dstB
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_compressBound(srcSize: usize, prefsPtr: *const LZ4F_preferences_t) -> usize {
+pub unsafe extern "C" fn LZ4F_compressBound(
+    srcSize: usize,
+    prefsPtr: *const LZ4F_preferences_t,
+) -> usize {
     let prefs = unsafe { read_prefs(prefsPtr) };
     frame::compress_bound(srcSize, prefs.as_ref())
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_compressEnd(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, cOptPtr: *const LZ4F_compressOptions_t) -> usize {
+pub unsafe extern "C" fn LZ4F_compressEnd(
+    cctx: *mut LZ4F_cctx,
+    dstBuffer: *mut c_void,
+    dstCapacity: usize,
+    cOptPtr: *const LZ4F_compressOptions_t,
+) -> usize {
     if cctx.is_null() {
         return frame::Error::ParameterNull.to_code();
     }
@@ -356,26 +826,49 @@ pub unsafe extern "C" fn LZ4F_compressEnd(cctx: *mut LZ4F_cctx, dstBuffer: *mut 
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_compressFrame(dstBuffer: *mut c_void, dstCapacity: usize, srcBuffer: *const c_void, srcSize: usize, preferencesPtr: *const LZ4F_preferences_t) -> usize {
+pub unsafe extern "C" fn LZ4F_compressFrame(
+    dstBuffer: *mut c_void,
+    dstCapacity: usize,
+    srcBuffer: *const c_void,
+    srcSize: usize,
+    preferencesPtr: *const LZ4F_preferences_t,
+) -> usize {
     // C uses a stack context here to avoid an allocation (lz4frame.c:496); ours
     // is a short-lived Box, which is the same lifetime with a different home.
     let mut cctx = Cctx::new();
     let dst = unsafe { opt_slice_mut(dstBuffer, dstCapacity) };
     let src = unsafe { opt_slice(srcBuffer, srcSize) };
     let prefs = unsafe { read_prefs(preferencesPtr) };
-    f_result(frame::compress_frame(&mut cctx, dst, src, None, prefs.as_ref()))
+    f_result(frame::compress_frame(
+        &mut cctx,
+        dst,
+        src,
+        None,
+        prefs.as_ref(),
+    ))
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_compressFrameBound(srcSize: usize, preferencesPtr: *const LZ4F_preferences_t) -> usize {
+pub unsafe extern "C" fn LZ4F_compressFrameBound(
+    srcSize: usize,
+    preferencesPtr: *const LZ4F_preferences_t,
+) -> usize {
     let prefs = unsafe { read_prefs(preferencesPtr) };
     frame::compress_frame_bound(srcSize, prefs.as_ref())
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_compressFrame_usingCDict(cctx: *mut LZ4F_cctx, dst: *mut c_void, dstCapacity: usize, src: *const c_void, srcSize: usize, cdict: *const LZ4F_CDict, preferencesPtr: *const LZ4F_preferences_t) -> usize {
+pub unsafe extern "C" fn LZ4F_compressFrame_usingCDict(
+    cctx: *mut LZ4F_cctx,
+    dst: *mut c_void,
+    dstCapacity: usize,
+    src: *const c_void,
+    srcSize: usize,
+    cdict: *const LZ4F_CDict,
+    preferencesPtr: *const LZ4F_preferences_t,
+) -> usize {
     if cctx.is_null() {
         return frame::Error::ParameterNull.to_code();
     }
@@ -393,7 +886,14 @@ pub unsafe extern "C" fn LZ4F_compressFrame_usingCDict(cctx: *mut LZ4F_cctx, dst
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_compressUpdate(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, srcBuffer: *const c_void, srcSize: usize, cOptPtr: *const LZ4F_compressOptions_t) -> usize {
+pub unsafe extern "C" fn LZ4F_compressUpdate(
+    cctx: *mut LZ4F_cctx,
+    dstBuffer: *mut c_void,
+    dstCapacity: usize,
+    srcBuffer: *const c_void,
+    srcSize: usize,
+    cOptPtr: *const LZ4F_compressOptions_t,
+) -> usize {
     if cctx.is_null() {
         return frame::Error::ParameterNull.to_code();
     }
@@ -411,7 +911,10 @@ pub extern "C" fn LZ4F_compressionLevel_max() -> c_int {
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_createCDict(dictBuffer: *const c_void, dictSize: usize) -> *mut LZ4F_CDict {
+pub unsafe extern "C" fn LZ4F_createCDict(
+    dictBuffer: *const c_void,
+    dictSize: usize,
+) -> *mut LZ4F_CDict {
     LZ4F_createCDict_advanced(
         LZ4F_CustomMem {
             customAlloc: core::ptr::null_mut(),
@@ -426,7 +929,11 @@ pub unsafe extern "C" fn LZ4F_createCDict(dictBuffer: *const c_void, dictSize: u
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_createCDict_advanced(customMem: LZ4F_CustomMem, dictBuffer: *const c_void, dictSize: usize) -> *mut LZ4F_CDict {
+pub unsafe extern "C" fn LZ4F_createCDict_advanced(
+    customMem: LZ4F_CustomMem,
+    dictBuffer: *const c_void,
+    dictSize: usize,
+) -> *mut LZ4F_CDict {
     if dictBuffer.is_null() {
         return core::ptr::null_mut();
     }
@@ -436,7 +943,10 @@ pub unsafe extern "C" fn LZ4F_createCDict_advanced(customMem: LZ4F_CustomMem, di
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_createCompressionContext(cctxPtr: *mut *mut LZ4F_cctx, version: c_uint) -> LZ4F_errorCode_t {
+pub unsafe extern "C" fn LZ4F_createCompressionContext(
+    cctxPtr: *mut *mut LZ4F_cctx,
+    version: c_uint,
+) -> LZ4F_errorCode_t {
     if cctxPtr.is_null() {
         return frame::Error::ParameterNull.to_code();
     }
@@ -450,7 +960,10 @@ pub unsafe extern "C" fn LZ4F_createCompressionContext(cctxPtr: *mut *mut LZ4F_c
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_createCompressionContext_advanced(customMem: LZ4F_CustomMem, version: c_uint) -> *mut LZ4F_cctx {
+pub unsafe extern "C" fn LZ4F_createCompressionContext_advanced(
+    customMem: LZ4F_CustomMem,
+    version: c_uint,
+) -> *mut LZ4F_cctx {
     let mut c = Cctx::new();
     c.version = version as u32;
     unsafe { owned_new(customMem, c) as *mut LZ4F_cctx }
@@ -458,7 +971,10 @@ pub unsafe extern "C" fn LZ4F_createCompressionContext_advanced(customMem: LZ4F_
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_createDecompressionContext(dctxPtr: *mut *mut LZ4F_dctx, version: c_uint) -> LZ4F_errorCode_t {
+pub unsafe extern "C" fn LZ4F_createDecompressionContext(
+    dctxPtr: *mut *mut LZ4F_dctx,
+    version: c_uint,
+) -> LZ4F_errorCode_t {
     if dctxPtr.is_null() {
         return frame::Error::ParameterNull.to_code();
     }
@@ -472,7 +988,10 @@ pub unsafe extern "C" fn LZ4F_createDecompressionContext(dctxPtr: *mut *mut LZ4F
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_createDecompressionContext_advanced(customMem: LZ4F_CustomMem, version: c_uint) -> *mut LZ4F_dctx {
+pub unsafe extern "C" fn LZ4F_createDecompressionContext_advanced(
+    customMem: LZ4F_CustomMem,
+    version: c_uint,
+) -> *mut LZ4F_dctx {
     let mut d = Dctx::new();
     d.version = version as u32;
     unsafe { owned_new(customMem, d) as *mut LZ4F_dctx }
@@ -491,16 +1010,38 @@ pub unsafe extern "C" fn LZ4F_dctx_size(dctx: *const LZ4F_dctx) -> usize {
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_decompress(dctx: *mut LZ4F_dctx, dstBuffer: *mut c_void, dstSizePtr: *mut usize, srcBuffer: *const c_void, srcSizePtr: *mut usize, dOptPtr: *const LZ4F_decompressOptions_t) -> usize {
+pub unsafe extern "C" fn LZ4F_decompress(
+    dctx: *mut LZ4F_dctx,
+    dstBuffer: *mut c_void,
+    dstSizePtr: *mut usize,
+    srcBuffer: *const c_void,
+    srcSizePtr: *mut usize,
+    dOptPtr: *const LZ4F_decompressOptions_t,
+) -> usize {
     LZ4F_decompress_usingDict(
-        dctx, dstBuffer, dstSizePtr, srcBuffer, srcSizePtr,
-        core::ptr::null(), 0, dOptPtr,
+        dctx,
+        dstBuffer,
+        dstSizePtr,
+        srcBuffer,
+        srcSizePtr,
+        core::ptr::null(),
+        0,
+        dOptPtr,
     )
 }
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_decompress_usingDict(dctxPtr: *mut LZ4F_dctx, dstBuffer: *mut c_void, dstSizePtr: *mut usize, srcBuffer: *const c_void, srcSizePtr: *mut usize, dict: *const c_void, dictSize: usize, decompressOptionsPtr: *const LZ4F_decompressOptions_t) -> usize {
+pub unsafe extern "C" fn LZ4F_decompress_usingDict(
+    dctxPtr: *mut LZ4F_dctx,
+    dstBuffer: *mut c_void,
+    dstSizePtr: *mut usize,
+    srcBuffer: *const c_void,
+    srcSizePtr: *mut usize,
+    dict: *const c_void,
+    dictSize: usize,
+    decompressOptionsPtr: *const LZ4F_decompressOptions_t,
+) -> usize {
     if dctxPtr.is_null() || dstSizePtr.is_null() || srcSizePtr.is_null() {
         return frame::Error::ParameterNull.to_code();
     }
@@ -540,7 +1081,12 @@ pub unsafe extern "C" fn LZ4F_decompress_usingDict(dctxPtr: *mut LZ4F_dctx, dstB
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_flush(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, cOptPtr: *const LZ4F_compressOptions_t) -> usize {
+pub unsafe extern "C" fn LZ4F_flush(
+    cctx: *mut LZ4F_cctx,
+    dstBuffer: *mut c_void,
+    dstCapacity: usize,
+    cOptPtr: *const LZ4F_compressOptions_t,
+) -> usize {
     if cctx.is_null() {
         return frame::Error::ParameterNull.to_code();
     }
@@ -606,7 +1152,12 @@ pub extern "C" fn LZ4F_getErrorName(code: LZ4F_errorCode_t) -> *const c_char {
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_getFrameInfo(dctx: *mut LZ4F_dctx, frameInfoPtr: *mut LZ4F_frameInfo_t, srcBuffer: *const c_void, srcSizePtr: *mut usize) -> usize {
+pub unsafe extern "C" fn LZ4F_getFrameInfo(
+    dctx: *mut LZ4F_dctx,
+    frameInfoPtr: *mut LZ4F_frameInfo_t,
+    srcBuffer: *const c_void,
+    srcSizePtr: *mut usize,
+) -> usize {
     if dctx.is_null() {
         return frame::Error::ParameterNull.to_code();
     }
@@ -653,7 +1204,6 @@ pub unsafe extern "C" fn LZ4F_headerSize(src: *const c_void, srcSize: usize) -> 
 pub extern "C" fn LZ4F_isError(code: LZ4F_errorCode_t) -> c_uint {
     c_uint::from(frame::is_error(code))
 }
-
 
 // ===========================================================================
 // File API (lib/lz4file.c)
@@ -706,7 +1256,11 @@ struct WriteHandle {
 
 /// from lib/lz4file.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_read(lz4fRead: *mut LZ4_readFile_t, buf: *mut c_void, size: usize) -> usize {
+pub unsafe extern "C" fn LZ4F_read(
+    lz4fRead: *mut LZ4_readFile_t,
+    buf: *mut c_void,
+    size: usize,
+) -> usize {
     if lz4fRead.is_null() || buf.is_null() {
         return frame::Error::ParameterNull.to_code();
     }
@@ -731,7 +1285,10 @@ pub unsafe extern "C" fn LZ4F_readClose(lz4fRead: *mut LZ4_readFile_t) -> LZ4F_e
 
 /// from lib/lz4file.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_readOpen(lz4fRead: *mut *mut LZ4_readFile_t, fp: *mut FILE) -> LZ4F_errorCode_t {
+pub unsafe extern "C" fn LZ4F_readOpen(
+    lz4fRead: *mut *mut LZ4_readFile_t,
+    fp: *mut FILE,
+) -> LZ4F_errorCode_t {
     if fp.is_null() || lz4fRead.is_null() {
         return frame::Error::ParameterNull.to_code();
     }
@@ -757,7 +1314,14 @@ pub unsafe extern "C" fn LZ4F_resetDecompressionContext(dctx: *mut LZ4F_dctx) {
 
 /// from lib/lz4frame.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_uncompressedUpdate(cctx: *mut LZ4F_cctx, dstBuffer: *mut c_void, dstCapacity: usize, srcBuffer: *const c_void, srcSize: usize, cOptPtr: *const LZ4F_compressOptions_t) -> usize {
+pub unsafe extern "C" fn LZ4F_uncompressedUpdate(
+    cctx: *mut LZ4F_cctx,
+    dstBuffer: *mut c_void,
+    dstCapacity: usize,
+    srcBuffer: *const c_void,
+    srcSize: usize,
+    cOptPtr: *const LZ4F_compressOptions_t,
+) -> usize {
     if cctx.is_null() {
         return frame::Error::ParameterNull.to_code();
     }
@@ -769,7 +1333,11 @@ pub unsafe extern "C" fn LZ4F_uncompressedUpdate(cctx: *mut LZ4F_cctx, dstBuffer
 
 /// from lib/lz4file.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_write(lz4fWrite: *mut LZ4_writeFile_t, buf: *const c_void, size: usize) -> usize {
+pub unsafe extern "C" fn LZ4F_write(
+    lz4fWrite: *mut LZ4_writeFile_t,
+    buf: *const c_void,
+    size: usize,
+) -> usize {
     if lz4fWrite.is_null() || buf.is_null() {
         return frame::Error::ParameterNull.to_code();
     }
@@ -800,7 +1368,11 @@ pub unsafe extern "C" fn LZ4F_writeClose(lz4fWrite: *mut LZ4_writeFile_t) -> LZ4
 
 /// from lib/lz4file.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4F_writeOpen(lz4fWrite: *mut *mut LZ4_writeFile_t, fp: *mut FILE, prefsPtr: *const LZ4F_preferences_t) -> LZ4F_errorCode_t {
+pub unsafe extern "C" fn LZ4F_writeOpen(
+    lz4fWrite: *mut *mut LZ4_writeFile_t,
+    fp: *mut FILE,
+    prefsPtr: *const LZ4F_preferences_t,
+) -> LZ4F_errorCode_t {
     if fp.is_null() || lz4fWrite.is_null() {
         return frame::Error::ParameterNull.to_code();
     }
@@ -852,21 +1424,39 @@ unsafe fn as_xxh64_ref(p: *const XXH64_state_t) -> &'static Xxh64State {
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4_XXH32(input: *const c_void, length: usize, seed: c_uint) -> XXH32_hash_t {
-    let data = if input.is_null() { &[] } else { unsafe { slice::from_raw_parts(input as *const u8, length) } };
+pub unsafe extern "C" fn LZ4_XXH32(
+    input: *const c_void,
+    length: usize,
+    seed: c_uint,
+) -> XXH32_hash_t {
+    let data = if input.is_null() {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(input as *const u8, length) }
+    };
     crate::xxh::xxh32(data, seed)
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4_XXH32_canonicalFromHash(dst: *mut XXH32_canonical_t, hash: XXH32_hash_t) {
-    unsafe { (*dst).digest = crate::xxh::xxh32_canonical_from_hash(hash); }
+pub unsafe extern "C" fn LZ4_XXH32_canonicalFromHash(
+    dst: *mut XXH32_canonical_t,
+    hash: XXH32_hash_t,
+) {
+    unsafe {
+        (*dst).digest = crate::xxh::xxh32_canonical_from_hash(hash);
+    }
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4_XXH32_copyState(dst_state: *mut XXH32_state_t, src_state: *const XXH32_state_t) {
-    unsafe { *as_xxh32(dst_state) = *as_xxh32_ref(src_state); }
+pub unsafe extern "C" fn LZ4_XXH32_copyState(
+    dst_state: *mut XXH32_state_t,
+    src_state: *const XXH32_state_t,
+) {
+    unsafe {
+        *as_xxh32(dst_state) = *as_xxh32_ref(src_state);
+    }
 }
 
 /// from lib/xxhash.h — allocates; caller must free with LZ4_XXH32_freeState
@@ -874,9 +1464,15 @@ pub unsafe extern "C" fn LZ4_XXH32_copyState(dst_state: *mut XXH32_state_t, src_
 pub extern "C" fn LZ4_XXH32_createState() -> *mut XXH32_state_t {
     // Safety: Box::into_raw gives us a valid, non-null pointer.
     let b: Box<Xxh32State> = Box::new(Xxh32State {
-        total_len_32: 0, large_len: 0,
-        v1: 0, v2: 0, v3: 0, v4: 0,
-        mem: [0; 16], memsize: 0, reserved: 0,
+        total_len_32: 0,
+        large_len: 0,
+        v1: 0,
+        v2: 0,
+        v3: 0,
+        v4: 0,
+        mem: [0; 16],
+        memsize: 0,
+        reserved: 0,
     });
     Box::into_raw(b) as *mut XXH32_state_t
 }
@@ -891,28 +1487,41 @@ pub unsafe extern "C" fn LZ4_XXH32_digest(statePtr: *const XXH32_state_t) -> XXH
 #[no_mangle]
 pub unsafe extern "C" fn LZ4_XXH32_freeState(statePtr: *mut XXH32_state_t) -> XXH_errorcode {
     if !statePtr.is_null() {
-        unsafe { drop(Box::from_raw(statePtr as *mut Xxh32State)); }
+        unsafe {
+            drop(Box::from_raw(statePtr as *mut Xxh32State));
+        }
     }
     crate::types::XXH_OK
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4_XXH32_hashFromCanonical(src: *const XXH32_canonical_t) -> XXH32_hash_t {
+pub unsafe extern "C" fn LZ4_XXH32_hashFromCanonical(
+    src: *const XXH32_canonical_t,
+) -> XXH32_hash_t {
     crate::xxh::xxh32_hash_from_canonical(unsafe { &(*src).digest })
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4_XXH32_reset(statePtr: *mut XXH32_state_t, seed: c_uint) -> XXH_errorcode {
+pub unsafe extern "C" fn LZ4_XXH32_reset(
+    statePtr: *mut XXH32_state_t,
+    seed: c_uint,
+) -> XXH_errorcode {
     crate::xxh::xxh32_reset(unsafe { as_xxh32(statePtr) }, seed);
     crate::types::XXH_OK
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4_XXH32_update(statePtr: *mut XXH32_state_t, input: *const c_void, length: usize) -> XXH_errorcode {
-    if input.is_null() { return crate::types::XXH_ERROR; }
+pub unsafe extern "C" fn LZ4_XXH32_update(
+    statePtr: *mut XXH32_state_t,
+    input: *const c_void,
+    length: usize,
+) -> XXH_errorcode {
+    if input.is_null() {
+        return crate::types::XXH_ERROR;
+    }
     let data = unsafe { slice::from_raw_parts(input as *const u8, length) };
     crate::xxh::xxh32_update(unsafe { as_xxh32(statePtr) }, data);
     crate::types::XXH_OK
@@ -920,21 +1529,39 @@ pub unsafe extern "C" fn LZ4_XXH32_update(statePtr: *mut XXH32_state_t, input: *
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4_XXH64(input: *const c_void, length: usize, seed: c_ulonglong) -> XXH64_hash_t {
-    let data = if input.is_null() { &[] } else { unsafe { slice::from_raw_parts(input as *const u8, length) } };
+pub unsafe extern "C" fn LZ4_XXH64(
+    input: *const c_void,
+    length: usize,
+    seed: c_ulonglong,
+) -> XXH64_hash_t {
+    let data = if input.is_null() {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(input as *const u8, length) }
+    };
     crate::xxh::xxh64(data, seed)
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4_XXH64_canonicalFromHash(dst: *mut XXH64_canonical_t, hash: XXH64_hash_t) {
-    unsafe { (*dst).digest = crate::xxh::xxh64_canonical_from_hash(hash); }
+pub unsafe extern "C" fn LZ4_XXH64_canonicalFromHash(
+    dst: *mut XXH64_canonical_t,
+    hash: XXH64_hash_t,
+) {
+    unsafe {
+        (*dst).digest = crate::xxh::xxh64_canonical_from_hash(hash);
+    }
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4_XXH64_copyState(dst_state: *mut XXH64_state_t, src_state: *const XXH64_state_t) {
-    unsafe { *as_xxh64(dst_state) = *as_xxh64_ref(src_state); }
+pub unsafe extern "C" fn LZ4_XXH64_copyState(
+    dst_state: *mut XXH64_state_t,
+    src_state: *const XXH64_state_t,
+) {
+    unsafe {
+        *as_xxh64(dst_state) = *as_xxh64_ref(src_state);
+    }
 }
 
 /// from lib/xxhash.h — allocates; caller must free with LZ4_XXH64_freeState
@@ -942,8 +1569,13 @@ pub unsafe extern "C" fn LZ4_XXH64_copyState(dst_state: *mut XXH64_state_t, src_
 pub extern "C" fn LZ4_XXH64_createState() -> *mut XXH64_state_t {
     let b: Box<Xxh64State> = Box::new(Xxh64State {
         total_len: 0,
-        v1: 0, v2: 0, v3: 0, v4: 0,
-        mem: [0; 32], memsize: 0, reserved: [0; 2],
+        v1: 0,
+        v2: 0,
+        v3: 0,
+        v4: 0,
+        mem: [0; 32],
+        memsize: 0,
+        reserved: [0; 2],
     });
     Box::into_raw(b) as *mut XXH64_state_t
 }
@@ -958,28 +1590,41 @@ pub unsafe extern "C" fn LZ4_XXH64_digest(statePtr: *const XXH64_state_t) -> XXH
 #[no_mangle]
 pub unsafe extern "C" fn LZ4_XXH64_freeState(statePtr: *mut XXH64_state_t) -> XXH_errorcode {
     if !statePtr.is_null() {
-        unsafe { drop(Box::from_raw(statePtr as *mut Xxh64State)); }
+        unsafe {
+            drop(Box::from_raw(statePtr as *mut Xxh64State));
+        }
     }
     crate::types::XXH_OK
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4_XXH64_hashFromCanonical(src: *const XXH64_canonical_t) -> XXH64_hash_t {
+pub unsafe extern "C" fn LZ4_XXH64_hashFromCanonical(
+    src: *const XXH64_canonical_t,
+) -> XXH64_hash_t {
     crate::xxh::xxh64_hash_from_canonical(unsafe { &(*src).digest })
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4_XXH64_reset(statePtr: *mut XXH64_state_t, seed: c_ulonglong) -> XXH_errorcode {
+pub unsafe extern "C" fn LZ4_XXH64_reset(
+    statePtr: *mut XXH64_state_t,
+    seed: c_ulonglong,
+) -> XXH_errorcode {
     crate::xxh::xxh64_reset(unsafe { as_xxh64(statePtr) }, seed);
     crate::types::XXH_OK
 }
 
 /// from lib/xxhash.h
 #[no_mangle]
-pub unsafe extern "C" fn LZ4_XXH64_update(statePtr: *mut XXH64_state_t, input: *const c_void, length: usize) -> XXH_errorcode {
-    if input.is_null() { return crate::types::XXH_ERROR; }
+pub unsafe extern "C" fn LZ4_XXH64_update(
+    statePtr: *mut XXH64_state_t,
+    input: *const c_void,
+    length: usize,
+) -> XXH_errorcode {
+    if input.is_null() {
+        return crate::types::XXH_ERROR;
+    }
     let data = unsafe { slice::from_raw_parts(input as *const u8, length) };
     crate::xxh::xxh64_update(unsafe { as_xxh64(statePtr) }, data);
     crate::types::XXH_OK
@@ -993,14 +1638,45 @@ pub extern "C" fn LZ4_XXH_versionNumber() -> c_uint {
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_attach_HC_dictionary(working_stream: *mut LZ4_streamHC_t, dictionary_stream: *const LZ4_streamHC_t) {
+pub extern "C" fn LZ4_attach_HC_dictionary(
+    working_stream: *mut LZ4_streamHC_t,
+    dictionary_stream: *const LZ4_streamHC_t,
+) {
     unimplemented!("LZ4_attach_HC_dictionary")
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_attach_dictionary(workingStream: *mut LZ4_stream_t, dictionaryStream: *const LZ4_stream_t) {
-    unimplemented!("LZ4_attach_dictionary")
+pub unsafe extern "C" fn LZ4_attach_dictionary(
+    workingStream: *mut LZ4_stream_t,
+    dictionaryStream: *const LZ4_stream_t,
+) {
+    if workingStream.is_null() {
+        return;
+    }
+    let dictionary_size = if dictionaryStream.is_null() {
+        0
+    } else {
+        unsafe {
+            core::ptr::addr_of!((*dictionaryStream.cast::<AbiStreamState>()).dict_size).read()
+        }
+    };
+    let Some(mut working) = abi_stream_ptr(workingStream) else {
+        return;
+    };
+    let working = unsafe { working.as_mut() };
+    if dictionaryStream.is_null() {
+        working.dict_ctx = 0;
+        return;
+    }
+    if working.current_offset == 0 {
+        working.current_offset = 64 * 1024;
+    }
+    working.dict_ctx = if dictionary_size == 0 {
+        0
+    } else {
+        dictionaryStream as usize
+    };
 }
 
 /// from lib/lz4.h
@@ -1018,140 +1694,343 @@ pub extern "C" fn LZ4_compressBound(inputSize: c_int) -> c_int {
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_compressHC(source: *const c_char, dest: *mut c_char, inputSize: c_int) -> c_int {
+pub extern "C" fn LZ4_compressHC(
+    source: *const c_char,
+    dest: *mut c_char,
+    inputSize: c_int,
+) -> c_int {
     unimplemented!("LZ4_compressHC")
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_compressHC2(source: *const c_char, dest: *mut c_char, inputSize: c_int, compressionLevel: c_int) -> c_int {
+pub extern "C" fn LZ4_compressHC2(
+    source: *const c_char,
+    dest: *mut c_char,
+    inputSize: c_int,
+    compressionLevel: c_int,
+) -> c_int {
     unimplemented!("LZ4_compressHC2")
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_compressHC2_continue(LZ4HC_Data: *mut c_void, source: *const c_char, dest: *mut c_char, inputSize: c_int, compressionLevel: c_int) -> c_int {
+pub extern "C" fn LZ4_compressHC2_continue(
+    LZ4HC_Data: *mut c_void,
+    source: *const c_char,
+    dest: *mut c_char,
+    inputSize: c_int,
+    compressionLevel: c_int,
+) -> c_int {
     unimplemented!("LZ4_compressHC2_continue")
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_compressHC2_limitedOutput(source: *const c_char, dest: *mut c_char, inputSize: c_int, maxOutputSize: c_int, compressionLevel: c_int) -> c_int {
+pub extern "C" fn LZ4_compressHC2_limitedOutput(
+    source: *const c_char,
+    dest: *mut c_char,
+    inputSize: c_int,
+    maxOutputSize: c_int,
+    compressionLevel: c_int,
+) -> c_int {
     unimplemented!("LZ4_compressHC2_limitedOutput")
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_compressHC2_limitedOutput_continue(LZ4HC_Data: *mut c_void, source: *const c_char, dest: *mut c_char, inputSize: c_int, maxOutputSize: c_int, compressionLevel: c_int) -> c_int {
+pub extern "C" fn LZ4_compressHC2_limitedOutput_continue(
+    LZ4HC_Data: *mut c_void,
+    source: *const c_char,
+    dest: *mut c_char,
+    inputSize: c_int,
+    maxOutputSize: c_int,
+    compressionLevel: c_int,
+) -> c_int {
     unimplemented!("LZ4_compressHC2_limitedOutput_continue")
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_compressHC2_limitedOutput_withStateHC(state: *mut c_void, source: *const c_char, dest: *mut c_char, inputSize: c_int, maxOutputSize: c_int, compressionLevel: c_int) -> c_int {
+pub extern "C" fn LZ4_compressHC2_limitedOutput_withStateHC(
+    state: *mut c_void,
+    source: *const c_char,
+    dest: *mut c_char,
+    inputSize: c_int,
+    maxOutputSize: c_int,
+    compressionLevel: c_int,
+) -> c_int {
     unimplemented!("LZ4_compressHC2_limitedOutput_withStateHC")
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_compressHC2_withStateHC(state: *mut c_void, source: *const c_char, dest: *mut c_char, inputSize: c_int, compressionLevel: c_int) -> c_int {
+pub extern "C" fn LZ4_compressHC2_withStateHC(
+    state: *mut c_void,
+    source: *const c_char,
+    dest: *mut c_char,
+    inputSize: c_int,
+    compressionLevel: c_int,
+) -> c_int {
     unimplemented!("LZ4_compressHC2_withStateHC")
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_compressHC_continue(LZ4_streamHCPtr: *mut LZ4_streamHC_t, source: *const c_char, dest: *mut c_char, inputSize: c_int) -> c_int {
+pub extern "C" fn LZ4_compressHC_continue(
+    LZ4_streamHCPtr: *mut LZ4_streamHC_t,
+    source: *const c_char,
+    dest: *mut c_char,
+    inputSize: c_int,
+) -> c_int {
     unimplemented!("LZ4_compressHC_continue")
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_compressHC_limitedOutput(source: *const c_char, dest: *mut c_char, inputSize: c_int, maxOutputSize: c_int) -> c_int {
+pub extern "C" fn LZ4_compressHC_limitedOutput(
+    source: *const c_char,
+    dest: *mut c_char,
+    inputSize: c_int,
+    maxOutputSize: c_int,
+) -> c_int {
     unimplemented!("LZ4_compressHC_limitedOutput")
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_compressHC_limitedOutput_continue(LZ4_streamHCPtr: *mut LZ4_streamHC_t, source: *const c_char, dest: *mut c_char, inputSize: c_int, maxOutputSize: c_int) -> c_int {
+pub extern "C" fn LZ4_compressHC_limitedOutput_continue(
+    LZ4_streamHCPtr: *mut LZ4_streamHC_t,
+    source: *const c_char,
+    dest: *mut c_char,
+    inputSize: c_int,
+    maxOutputSize: c_int,
+) -> c_int {
     unimplemented!("LZ4_compressHC_limitedOutput_continue")
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_compressHC_limitedOutput_withStateHC(state: *mut c_void, source: *const c_char, dest: *mut c_char, inputSize: c_int, maxOutputSize: c_int) -> c_int {
+pub extern "C" fn LZ4_compressHC_limitedOutput_withStateHC(
+    state: *mut c_void,
+    source: *const c_char,
+    dest: *mut c_char,
+    inputSize: c_int,
+    maxOutputSize: c_int,
+) -> c_int {
     unimplemented!("LZ4_compressHC_limitedOutput_withStateHC")
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_compressHC_withStateHC(state: *mut c_void, source: *const c_char, dest: *mut c_char, inputSize: c_int) -> c_int {
+pub extern "C" fn LZ4_compressHC_withStateHC(
+    state: *mut c_void,
+    source: *const c_char,
+    dest: *mut c_char,
+    inputSize: c_int,
+) -> c_int {
     unimplemented!("LZ4_compressHC_withStateHC")
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_compress_HC(src: *const c_char, dst: *mut c_char, srcSize: c_int, dstCapacity: c_int, compressionLevel: c_int) -> c_int {
+pub extern "C" fn LZ4_compress_HC(
+    src: *const c_char,
+    dst: *mut c_char,
+    srcSize: c_int,
+    dstCapacity: c_int,
+    compressionLevel: c_int,
+) -> c_int {
     unimplemented!("LZ4_compress_HC")
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_compress_HC_continue(streamHCPtr: *mut LZ4_streamHC_t, src: *const c_char, dst: *mut c_char, srcSize: c_int, maxDstSize: c_int) -> c_int {
+pub extern "C" fn LZ4_compress_HC_continue(
+    streamHCPtr: *mut LZ4_streamHC_t,
+    src: *const c_char,
+    dst: *mut c_char,
+    srcSize: c_int,
+    maxDstSize: c_int,
+) -> c_int {
     unimplemented!("LZ4_compress_HC_continue")
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_compress_HC_continue_destSize(LZ4_streamHCPtr: *mut LZ4_streamHC_t, src: *const c_char, dst: *mut c_char, srcSizePtr: *mut c_int, targetDstSize: c_int) -> c_int {
+pub extern "C" fn LZ4_compress_HC_continue_destSize(
+    LZ4_streamHCPtr: *mut LZ4_streamHC_t,
+    src: *const c_char,
+    dst: *mut c_char,
+    srcSizePtr: *mut c_int,
+    targetDstSize: c_int,
+) -> c_int {
     unimplemented!("LZ4_compress_HC_continue_destSize")
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_compress_HC_destSize(stateHC: *mut c_void, src: *const c_char, dst: *mut c_char, srcSizePtr: *mut c_int, targetDstSize: c_int, compressionLevel: c_int) -> c_int {
+pub extern "C" fn LZ4_compress_HC_destSize(
+    stateHC: *mut c_void,
+    src: *const c_char,
+    dst: *mut c_char,
+    srcSizePtr: *mut c_int,
+    targetDstSize: c_int,
+    compressionLevel: c_int,
+) -> c_int {
     unimplemented!("LZ4_compress_HC_destSize")
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_compress_HC_extStateHC(stateHC: *mut c_void, src: *const c_char, dst: *mut c_char, srcSize: c_int, maxDstSize: c_int, compressionLevel: c_int) -> c_int {
+pub extern "C" fn LZ4_compress_HC_extStateHC(
+    stateHC: *mut c_void,
+    src: *const c_char,
+    dst: *mut c_char,
+    srcSize: c_int,
+    maxDstSize: c_int,
+    compressionLevel: c_int,
+) -> c_int {
     unimplemented!("LZ4_compress_HC_extStateHC")
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_compress_HC_extStateHC_fastReset(state: *mut c_void, src: *const c_char, dst: *mut c_char, srcSize: c_int, dstCapacity: c_int, compressionLevel: c_int) -> c_int {
+pub extern "C" fn LZ4_compress_HC_extStateHC_fastReset(
+    state: *mut c_void,
+    src: *const c_char,
+    dst: *mut c_char,
+    srcSize: c_int,
+    dstCapacity: c_int,
+    compressionLevel: c_int,
+) -> c_int {
     unimplemented!("LZ4_compress_HC_extStateHC_fastReset")
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_compress_continue(LZ4_streamPtr: *mut LZ4_stream_t, source: *const c_char, dest: *mut c_char, inputSize: c_int) -> c_int {
-    unimplemented!("LZ4_compress_continue")
+pub unsafe extern "C" fn LZ4_compress_continue(
+    LZ4_streamPtr: *mut LZ4_stream_t,
+    source: *const c_char,
+    dest: *mut c_char,
+    inputSize: c_int,
+) -> c_int {
+    unsafe {
+        compress_continue_impl(
+            LZ4_streamPtr,
+            source,
+            dest,
+            inputSize,
+            LZ4_compressBound(inputSize),
+            1,
+            false,
+        )
+    }
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_compress_default(src: *const c_char, dst: *mut c_char, srcSize: c_int, dstCapacity: c_int) -> c_int {
+pub extern "C" fn LZ4_compress_default(
+    src: *const c_char,
+    dst: *mut c_char,
+    srcSize: c_int,
+    dstCapacity: c_int,
+) -> c_int {
     // lz4.c:1481 — acceleration 1.
     LZ4_compress_fast(src, dst, srcSize, dstCapacity, 1)
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_compress_destSize(src: *const c_char, dst: *mut c_char, srcSizePtr: *mut c_int, targetDstSize: c_int) -> c_int {
-    unimplemented!("LZ4_compress_destSize")
+pub extern "C" fn LZ4_compress_destSize(
+    src: *const c_char,
+    dst: *mut c_char,
+    srcSizePtr: *mut c_int,
+    targetDstSize: c_int,
+) -> c_int {
+    if srcSizePtr.is_null() || targetDstSize < 0 {
+        return 0;
+    }
+    let src_size = unsafe { *srcSizePtr };
+    if src_size < 0 || (src_size != 0 && src.is_null()) || dst.is_null() {
+        return 0;
+    }
+    unsafe {
+        with_buffers(
+            src,
+            src_size as usize,
+            dst,
+            targetDstSize as usize,
+            |buf, range, input| match block::compress_dest_size(buf, range, input, 1) {
+                Ok((written, consumed)) => {
+                    *srcSizePtr = consumed as c_int;
+                    written as c_int
+                }
+                Err(_) => 0,
+            },
+        )
+    }
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_compress_destSize_extState(state: *mut c_void, src: *const c_char, dst: *mut c_char, srcSizePtr: *mut c_int, targetDstSize: c_int, acceleration: c_int) -> c_int {
-    unimplemented!("LZ4_compress_destSize_extState")
+pub extern "C" fn LZ4_compress_destSize_extState(
+    state: *mut c_void,
+    src: *const c_char,
+    dst: *mut c_char,
+    srcSizePtr: *mut c_int,
+    targetDstSize: c_int,
+    acceleration: c_int,
+) -> c_int {
+    if state.is_null()
+        || state as usize % core::mem::align_of::<AbiStreamState>() != 0
+        || srcSizePtr.is_null()
+    {
+        return 0;
+    }
+    unsafe { (&mut *state.cast::<AbiStreamState>()).reset() };
+    let result = if acceleration == 1 {
+        LZ4_compress_destSize(src, dst, srcSizePtr, targetDstSize)
+    } else {
+        let src_size = unsafe { *srcSizePtr };
+        if src_size < 0 || targetDstSize < 0 || (src_size != 0 && src.is_null()) || dst.is_null() {
+            0
+        } else {
+            unsafe {
+                with_buffers(
+                    src,
+                    src_size as usize,
+                    dst,
+                    targetDstSize as usize,
+                    |buf, range, input| match block::compress_dest_size(
+                        buf,
+                        range,
+                        input,
+                        acceleration.max(1),
+                    ) {
+                        Ok((written, consumed)) => {
+                            *srcSizePtr = consumed as c_int;
+                            written as c_int
+                        }
+                        Err(_) => 0,
+                    },
+                )
+            }
+        }
+    };
+    unsafe { (&mut *state.cast::<AbiStreamState>()).reset() };
+    result
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_compress_fast(src: *const c_char, dst: *mut c_char, srcSize: c_int, dstCapacity: c_int, acceleration: c_int) -> c_int {
+pub extern "C" fn LZ4_compress_fast(
+    src: *const c_char,
+    dst: *mut c_char,
+    srcSize: c_int,
+    dstCapacity: c_int,
+    acceleration: c_int,
+) -> c_int {
     // A negative srcSize fails C's unsigned `> LZ4_MAX_INPUT_SIZE` test and
     // returns 0 (lz4.c:1369); the compress family never returns negative.
     if srcSize < 0 || (srcSize as u32) > block::LZ4_MAX_INPUT_SIZE || dstCapacity < 0 {
@@ -1173,64 +2052,132 @@ pub extern "C" fn LZ4_compress_fast(src: *const c_char, dst: *mut c_char, srcSiz
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_compress_fast_continue(streamPtr: *mut LZ4_stream_t, src: *const c_char, dst: *mut c_char, srcSize: c_int, dstCapacity: c_int, acceleration: c_int) -> c_int {
-    unimplemented!("LZ4_compress_fast_continue")
+pub unsafe extern "C" fn LZ4_compress_fast_continue(
+    streamPtr: *mut LZ4_stream_t,
+    src: *const c_char,
+    dst: *mut c_char,
+    srcSize: c_int,
+    dstCapacity: c_int,
+    acceleration: c_int,
+) -> c_int {
+    unsafe {
+        compress_continue_impl(
+            streamPtr,
+            src,
+            dst,
+            srcSize,
+            dstCapacity,
+            acceleration,
+            false,
+        )
+    }
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_compress_fast_extState(state: *mut c_void, src: *const c_char, dst: *mut c_char, srcSize: c_int, dstCapacity: c_int, acceleration: c_int) -> c_int {
-    // Deferred with streaming, not overlooked: unlike LZ4_compress_fast (which
-    // may use a table of our own choosing, since only the table's *contents*
-    // affect the output), this one must read and write the caller's
-    // LZ4_stream_t. That means pinning down LZ4_stream_t_internal's layout,
-    // which is the same work LZ4_loadDict / LZ4_compress_fast_continue need.
-    // LZ4_compress_withState and LZ4_compress_limitedOutput_withState
-    // (lz4.c:2791, :2795) are blocked on this too.
-    unimplemented!("LZ4_compress_fast_extState")
+pub extern "C" fn LZ4_compress_fast_extState(
+    state: *mut c_void,
+    src: *const c_char,
+    dst: *mut c_char,
+    srcSize: c_int,
+    dstCapacity: c_int,
+    acceleration: c_int,
+) -> c_int {
+    unsafe { compress_ext_state_impl(state, src, dst, srcSize, dstCapacity, acceleration, false) }
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_compress_fast_extState_fastReset(state: *mut c_void, src: *const c_char, dst: *mut c_char, srcSize: c_int, dstCapacity: c_int, acceleration: c_int) -> c_int {
-    unimplemented!("LZ4_compress_fast_extState_fastReset")
+pub extern "C" fn LZ4_compress_fast_extState_fastReset(
+    state: *mut c_void,
+    src: *const c_char,
+    dst: *mut c_char,
+    srcSize: c_int,
+    dstCapacity: c_int,
+    acceleration: c_int,
+) -> c_int {
+    unsafe { compress_ext_state_impl(state, src, dst, srcSize, dstCapacity, acceleration, true) }
 }
 
 /// from lib/lz4.c
 #[no_mangle]
-pub extern "C" fn LZ4_compress_forceExtDict(LZ4_dict: *mut LZ4_stream_t, source: *const c_char, dest: *mut c_char, srcSize: c_int) -> c_int {
-    unimplemented!("LZ4_compress_forceExtDict")
+pub unsafe extern "C" fn LZ4_compress_forceExtDict(
+    LZ4_dict: *mut LZ4_stream_t,
+    source: *const c_char,
+    dest: *mut c_char,
+    srcSize: c_int,
+) -> c_int {
+    unsafe {
+        compress_continue_impl(
+            LZ4_dict,
+            source,
+            dest,
+            srcSize,
+            LZ4_compressBound(srcSize),
+            1,
+            true,
+        )
+    }
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_compress_limitedOutput(src: *const c_char, dest: *mut c_char, srcSize: c_int, maxOutputSize: c_int) -> c_int {
+pub extern "C" fn LZ4_compress_limitedOutput(
+    src: *const c_char,
+    dest: *mut c_char,
+    srcSize: c_int,
+    maxOutputSize: c_int,
+) -> c_int {
     // lz4.c:2783 — deprecated alias.
     LZ4_compress_default(src, dest, srcSize, maxOutputSize)
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_compress_limitedOutput_continue(LZ4_streamPtr: *mut LZ4_stream_t, source: *const c_char, dest: *mut c_char, inputSize: c_int, maxOutputSize: c_int) -> c_int {
-    unimplemented!("LZ4_compress_limitedOutput_continue")
+pub unsafe extern "C" fn LZ4_compress_limitedOutput_continue(
+    LZ4_streamPtr: *mut LZ4_stream_t,
+    source: *const c_char,
+    dest: *mut c_char,
+    inputSize: c_int,
+    maxOutputSize: c_int,
+) -> c_int {
+    unsafe { LZ4_compress_fast_continue(LZ4_streamPtr, source, dest, inputSize, maxOutputSize, 1) }
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_compress_limitedOutput_withState(state: *mut c_void, source: *const c_char, dest: *mut c_char, inputSize: c_int, maxOutputSize: c_int) -> c_int {
-    unimplemented!("LZ4_compress_limitedOutput_withState")
+pub extern "C" fn LZ4_compress_limitedOutput_withState(
+    state: *mut c_void,
+    source: *const c_char,
+    dest: *mut c_char,
+    inputSize: c_int,
+    maxOutputSize: c_int,
+) -> c_int {
+    LZ4_compress_fast_extState(state, source, dest, inputSize, maxOutputSize, 1)
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_compress_withState(state: *mut c_void, source: *const c_char, dest: *mut c_char, inputSize: c_int) -> c_int {
-    unimplemented!("LZ4_compress_withState")
+pub extern "C" fn LZ4_compress_withState(
+    state: *mut c_void,
+    source: *const c_char,
+    dest: *mut c_char,
+    inputSize: c_int,
+) -> c_int {
+    LZ4_compress_fast_extState(
+        state,
+        source,
+        dest,
+        inputSize,
+        LZ4_compressBound(inputSize),
+        1,
+    )
 }
 
 /// from lib/lz4.h
 #[no_mangle]
 pub extern "C" fn LZ4_create(inputBuffer: *mut c_char) -> *mut c_void {
-    unimplemented!("LZ4_create")
+    LZ4_createStream().cast()
 }
 
 /// from lib/lz4hc.h
@@ -1242,13 +2189,13 @@ pub extern "C" fn LZ4_createHC(inputBuffer: *const c_char) -> *mut c_void {
 /// from lib/lz4.h
 #[no_mangle]
 pub extern "C" fn LZ4_createStream() -> *mut LZ4_stream_t {
-    unimplemented!("LZ4_createStream")
+    unsafe { std::alloc::alloc_zeroed(std::alloc::Layout::new::<AbiStreamState>()) }.cast()
 }
 
 /// from lib/lz4.h
 #[no_mangle]
 pub extern "C" fn LZ4_createStreamDecode() -> *mut LZ4_streamDecode_t {
-    unimplemented!("LZ4_createStreamDecode")
+    unsafe { std::alloc::alloc_zeroed(std::alloc::Layout::new::<AbiDecodeState>()) }.cast()
 }
 
 /// from lib/lz4hc.h
@@ -1260,36 +2207,104 @@ pub extern "C" fn LZ4_createStreamHC() -> *mut LZ4_streamHC_t {
 /// from lib/lz4.h
 #[no_mangle]
 pub extern "C" fn LZ4_decoderRingBufferSize(maxBlockSize: c_int) -> c_int {
-    unimplemented!("LZ4_decoderRingBufferSize")
+    if !(0..=0x7e00_0000).contains(&maxBlockSize) {
+        0
+    } else {
+        maxBlockSize.max(16) + 65_536 + 14
+    }
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_decompress_fast(src: *const c_char, dst: *mut c_char, originalSize: c_int) -> c_int {
-    unimplemented!("LZ4_decompress_fast")
+pub unsafe extern "C" fn LZ4_decompress_fast(
+    src: *const c_char,
+    dst: *mut c_char,
+    originalSize: c_int,
+) -> c_int {
+    unsafe { decompress_fast_impl(src, dst, originalSize, 0, 0, 0, 0) }
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_decompress_fast_continue(LZ4_streamDecode: *mut LZ4_streamDecode_t, src: *const c_char, dst: *mut c_char, originalSize: c_int) -> c_int {
-    unimplemented!("LZ4_decompress_fast_continue")
+pub unsafe extern "C" fn LZ4_decompress_fast_continue(
+    LZ4_streamDecode: *mut LZ4_streamDecode_t,
+    src: *const c_char,
+    dst: *mut c_char,
+    originalSize: c_int,
+) -> c_int {
+    unsafe { decompress_fast_continue_impl(LZ4_streamDecode, src, dst, originalSize) }
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_decompress_fast_usingDict(src: *const c_char, dst: *mut c_char, originalSize: c_int, dictStart: *const c_char, dictSize: c_int) -> c_int {
-    unimplemented!("LZ4_decompress_fast_usingDict")
+pub unsafe extern "C" fn LZ4_decompress_fast_usingDict(
+    src: *const c_char,
+    dst: *mut c_char,
+    originalSize: c_int,
+    dictStart: *const c_char,
+    dictSize: c_int,
+) -> c_int {
+    if dictSize < 0 || (dictSize != 0 && dictStart.is_null()) {
+        return -1;
+    }
+    if dictSize == 0 || (dictStart as usize).checked_add(dictSize as usize) == Some(dst as usize) {
+        unsafe {
+            decompress_fast_impl(
+                src,
+                dst,
+                originalSize,
+                0,
+                0,
+                dictStart as usize,
+                dictSize as usize,
+            )
+        }
+    } else {
+        unsafe {
+            decompress_fast_impl(
+                src,
+                dst,
+                originalSize,
+                dictStart as usize,
+                dictSize as usize,
+                0,
+                0,
+            )
+        }
+    }
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_decompress_fast_withPrefix64k(src: *const c_char, dst: *mut c_char, originalSize: c_int) -> c_int {
-    unimplemented!("LZ4_decompress_fast_withPrefix64k")
+pub unsafe extern "C" fn LZ4_decompress_fast_withPrefix64k(
+    src: *const c_char,
+    dst: *mut c_char,
+    originalSize: c_int,
+) -> c_int {
+    if dst.is_null() {
+        return -1;
+    }
+    unsafe {
+        decompress_fast_impl(
+            src,
+            dst,
+            originalSize,
+            0,
+            0,
+            dst.cast::<u8>().sub(64 * 1024) as usize,
+            64 * 1024,
+        )
+    }
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_decompress_safe(src: *const c_char, dst: *mut c_char, compressedSize: c_int, dstCapacity: c_int) -> c_int {
+pub extern "C" fn LZ4_decompress_safe(
+    src: *const c_char,
+    dst: *mut c_char,
+    compressedSize: c_int,
+    dstCapacity: c_int,
+) -> c_int {
     // lz4.c:2035 — `src == NULL` or a negative output size is a flat -1,
     // before any position-encoded error can arise.
     if src.is_null() || dstCapacity < 0 || compressedSize < 0 {
@@ -1308,19 +2323,51 @@ pub extern "C" fn LZ4_decompress_safe(src: *const c_char, dst: *mut c_char, comp
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_decompress_safe_continue(LZ4_streamDecode: *mut LZ4_streamDecode_t, src: *const c_char, dst: *mut c_char, srcSize: c_int, dstCapacity: c_int) -> c_int {
-    unimplemented!("LZ4_decompress_safe_continue")
+pub unsafe extern "C" fn LZ4_decompress_safe_continue(
+    LZ4_streamDecode: *mut LZ4_streamDecode_t,
+    src: *const c_char,
+    dst: *mut c_char,
+    srcSize: c_int,
+    dstCapacity: c_int,
+) -> c_int {
+    unsafe { decompress_safe_continue_impl(LZ4_streamDecode, src, dst, srcSize, dstCapacity) }
 }
 
 /// from lib/lz4.c
 #[no_mangle]
-pub extern "C" fn LZ4_decompress_safe_forceExtDict(source: *const c_char, dest: *mut c_char, compressedSize: c_int, maxOutputSize: c_int, dictStart: *const c_void, dictSize: usize) -> c_int {
-    unimplemented!("LZ4_decompress_safe_forceExtDict")
+pub unsafe extern "C" fn LZ4_decompress_safe_forceExtDict(
+    source: *const c_char,
+    dest: *mut c_char,
+    compressedSize: c_int,
+    maxOutputSize: c_int,
+    dictStart: *const c_void,
+    dictSize: usize,
+) -> c_int {
+    if dictSize > isize::MAX as usize {
+        return -1;
+    }
+    unsafe {
+        decompress_safe_impl(
+            source,
+            dest,
+            compressedSize,
+            maxOutputSize,
+            Some((dictStart.cast(), dictSize)),
+            true,
+            false,
+        )
+    }
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_decompress_safe_partial(src: *const c_char, dst: *mut c_char, srcSize: c_int, targetOutputSize: c_int, dstCapacity: c_int) -> c_int {
+pub extern "C" fn LZ4_decompress_safe_partial(
+    src: *const c_char,
+    dst: *mut c_char,
+    srcSize: c_int,
+    targetOutputSize: c_int,
+    dstCapacity: c_int,
+) -> c_int {
     // lz4.c:2480 takes MIN(targetOutputSize, dstCapacity) as the output size,
     // so a negative target reaches the `outputSize < 0` check and yields -1.
     if src.is_null() || dstCapacity < 0 || targetOutputSize < 0 || srcSize < 0 {
@@ -1347,26 +2394,102 @@ pub extern "C" fn LZ4_decompress_safe_partial(src: *const c_char, dst: *mut c_ch
 
 /// from lib/lz4.c
 #[no_mangle]
-pub extern "C" fn LZ4_decompress_safe_partial_forceExtDict(source: *const c_char, dest: *mut c_char, compressedSize: c_int, targetOutputSize: c_int, dstCapacity: c_int, dictStart: *const c_void, dictSize: usize) -> c_int {
-    unimplemented!("LZ4_decompress_safe_partial_forceExtDict")
+pub unsafe extern "C" fn LZ4_decompress_safe_partial_forceExtDict(
+    source: *const c_char,
+    dest: *mut c_char,
+    compressedSize: c_int,
+    targetOutputSize: c_int,
+    dstCapacity: c_int,
+    dictStart: *const c_void,
+    dictSize: usize,
+) -> c_int {
+    if dictSize > isize::MAX as usize {
+        return -1;
+    }
+    unsafe {
+        decompress_safe_impl(
+            source,
+            dest,
+            compressedSize,
+            targetOutputSize.min(dstCapacity),
+            Some((dictStart.cast(), dictSize)),
+            true,
+            true,
+        )
+    }
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_decompress_safe_partial_usingDict(src: *const c_char, dst: *mut c_char, compressedSize: c_int, targetOutputSize: c_int, maxOutputSize: c_int, dictStart: *const c_char, dictSize: c_int) -> c_int {
-    unimplemented!("LZ4_decompress_safe_partial_usingDict")
+pub unsafe extern "C" fn LZ4_decompress_safe_partial_usingDict(
+    src: *const c_char,
+    dst: *mut c_char,
+    compressedSize: c_int,
+    targetOutputSize: c_int,
+    maxOutputSize: c_int,
+    dictStart: *const c_char,
+    dictSize: c_int,
+) -> c_int {
+    if dictSize < 0 {
+        return -1;
+    }
+    let dictionary = (dictSize != 0).then_some((dictStart, dictSize as usize));
+    let external =
+        dictSize != 0 && (dictStart as usize).checked_add(dictSize as usize) != Some(dst as usize);
+    unsafe {
+        decompress_safe_impl(
+            src,
+            dst,
+            compressedSize,
+            targetOutputSize.min(maxOutputSize),
+            dictionary,
+            external,
+            true,
+        )
+    }
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_decompress_safe_usingDict(src: *const c_char, dst: *mut c_char, srcSize: c_int, dstCapacity: c_int, dictStart: *const c_char, dictSize: c_int) -> c_int {
-    unimplemented!("LZ4_decompress_safe_usingDict")
+pub unsafe extern "C" fn LZ4_decompress_safe_usingDict(
+    src: *const c_char,
+    dst: *mut c_char,
+    srcSize: c_int,
+    dstCapacity: c_int,
+    dictStart: *const c_char,
+    dictSize: c_int,
+) -> c_int {
+    if dictSize < 0 {
+        return -1;
+    }
+    let dictionary = (dictSize != 0).then_some((dictStart, dictSize as usize));
+    let external =
+        dictSize != 0 && (dictStart as usize).checked_add(dictSize as usize) != Some(dst as usize);
+    unsafe { decompress_safe_impl(src, dst, srcSize, dstCapacity, dictionary, external, false) }
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_decompress_safe_withPrefix64k(src: *const c_char, dst: *mut c_char, compressedSize: c_int, maxDstSize: c_int) -> c_int {
-    unimplemented!("LZ4_decompress_safe_withPrefix64k")
+pub unsafe extern "C" fn LZ4_decompress_safe_withPrefix64k(
+    src: *const c_char,
+    dst: *mut c_char,
+    compressedSize: c_int,
+    maxDstSize: c_int,
+) -> c_int {
+    if dst.is_null() {
+        return -1;
+    }
+    unsafe {
+        decompress_safe_impl(
+            src,
+            dst,
+            compressedSize,
+            maxDstSize,
+            Some((dst.cast::<u8>().sub(64 * 1024).cast(), 64 * 1024)),
+            false,
+            false,
+        )
+    }
 }
 
 /// from lib/lz4hc.h
@@ -1383,14 +2506,30 @@ pub extern "C" fn LZ4_freeHC(LZ4HC_Data: *mut c_void) -> c_int {
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_freeStream(streamPtr: *mut LZ4_stream_t) -> c_int {
-    unimplemented!("LZ4_freeStream")
+pub unsafe extern "C" fn LZ4_freeStream(streamPtr: *mut LZ4_stream_t) -> c_int {
+    if !streamPtr.is_null() {
+        unsafe {
+            std::alloc::dealloc(
+                streamPtr.cast(),
+                std::alloc::Layout::new::<AbiStreamState>(),
+            )
+        };
+    }
+    0
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_freeStreamDecode(LZ4_stream: *mut LZ4_streamDecode_t) -> c_int {
-    unimplemented!("LZ4_freeStreamDecode")
+pub unsafe extern "C" fn LZ4_freeStreamDecode(LZ4_stream: *mut LZ4_streamDecode_t) -> c_int {
+    if !LZ4_stream.is_null() {
+        unsafe {
+            std::alloc::dealloc(
+                LZ4_stream.cast(),
+                std::alloc::Layout::new::<AbiDecodeState>(),
+            )
+        };
+    }
+    0
 }
 
 /// from lib/lz4hc.h
@@ -1401,8 +2540,18 @@ pub extern "C" fn LZ4_freeStreamHC(streamHCPtr: *mut LZ4_streamHC_t) -> c_int {
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_initStream(stateBuffer: *mut c_void, size: usize) -> *mut LZ4_stream_t {
-    unimplemented!("LZ4_initStream")
+pub unsafe extern "C" fn LZ4_initStream(
+    stateBuffer: *mut c_void,
+    size: usize,
+) -> *mut LZ4_stream_t {
+    if stateBuffer.is_null()
+        || size < core::mem::size_of::<LZ4_stream_t>()
+        || stateBuffer as usize % core::mem::align_of::<LZ4_stream_t>() != 0
+    {
+        return core::ptr::null_mut();
+    }
+    unsafe { (&mut *stateBuffer.cast::<AbiStreamState>()).reset() };
+    stateBuffer.cast()
 }
 
 /// from lib/lz4hc.h
@@ -1413,26 +2562,40 @@ pub extern "C" fn LZ4_initStreamHC(buffer: *mut c_void, size: usize) -> *mut LZ4
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_loadDict(streamPtr: *mut LZ4_stream_t, dictionary: *const c_char, dictSize: c_int) -> c_int {
-    unimplemented!("LZ4_loadDict")
+pub unsafe extern "C" fn LZ4_loadDict(
+    streamPtr: *mut LZ4_stream_t,
+    dictionary: *const c_char,
+    dictSize: c_int,
+) -> c_int {
+    unsafe { load_dict_impl(streamPtr, dictionary, dictSize, false) }
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_loadDictHC(streamHCPtr: *mut LZ4_streamHC_t, dictionary: *const c_char, dictSize: c_int) -> c_int {
+pub extern "C" fn LZ4_loadDictHC(
+    streamHCPtr: *mut LZ4_streamHC_t,
+    dictionary: *const c_char,
+    dictSize: c_int,
+) -> c_int {
     unimplemented!("LZ4_loadDictHC")
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_loadDictSlow(streamPtr: *mut LZ4_stream_t, dictionary: *const c_char, dictSize: c_int) -> c_int {
-    unimplemented!("LZ4_loadDictSlow")
+pub unsafe extern "C" fn LZ4_loadDictSlow(
+    streamPtr: *mut LZ4_stream_t,
+    dictionary: *const c_char,
+    dictSize: c_int,
+) -> c_int {
+    unsafe { load_dict_impl(streamPtr, dictionary, dictSize, true) }
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_resetStream(streamPtr: *mut LZ4_stream_t) {
-    unimplemented!("LZ4_resetStream")
+pub unsafe extern "C" fn LZ4_resetStream(streamPtr: *mut LZ4_stream_t) {
+    if let Some(mut state) = abi_stream_ptr(streamPtr) {
+        unsafe { state.as_mut() }.reset();
+    }
 }
 
 /// from lib/lz4hc.h
@@ -1443,14 +2606,22 @@ pub extern "C" fn LZ4_resetStreamHC(streamHCPtr: *mut LZ4_streamHC_t, compressio
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_resetStreamHC_fast(streamHCPtr: *mut LZ4_streamHC_t, compressionLevel: c_int) {
+pub extern "C" fn LZ4_resetStreamHC_fast(
+    streamHCPtr: *mut LZ4_streamHC_t,
+    compressionLevel: c_int,
+) {
     unimplemented!("LZ4_resetStreamHC_fast")
 }
 
 /// from lib/lz4.h
 #[no_mangle]
 pub extern "C" fn LZ4_resetStreamState(state: *mut c_void, inputBuffer: *mut c_char) -> c_int {
-    unimplemented!("LZ4_resetStreamState")
+    if state.is_null() || state as usize % core::mem::align_of::<AbiStreamState>() != 0 {
+        1
+    } else {
+        unsafe { (&mut *state.cast::<AbiStreamState>()).reset() };
+        0
+    }
 }
 
 /// from lib/lz4hc.h
@@ -1461,32 +2632,79 @@ pub extern "C" fn LZ4_resetStreamStateHC(state: *mut c_void, inputBuffer: *mut c
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_resetStream_fast(streamPtr: *mut LZ4_stream_t) {
-    unimplemented!("LZ4_resetStream_fast")
+pub unsafe extern "C" fn LZ4_resetStream_fast(streamPtr: *mut LZ4_stream_t) {
+    if let Some(mut state) = abi_stream_ptr(streamPtr) {
+        unsafe { state.as_mut() }.reset_fast();
+    }
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_saveDict(streamPtr: *mut LZ4_stream_t, safeBuffer: *mut c_char, maxDictSize: c_int) -> c_int {
-    unimplemented!("LZ4_saveDict")
+pub unsafe extern "C" fn LZ4_saveDict(
+    streamPtr: *mut LZ4_stream_t,
+    safeBuffer: *mut c_char,
+    maxDictSize: c_int,
+) -> c_int {
+    let Some(mut state) = abi_stream_ptr(streamPtr) else {
+        return 0;
+    };
+    let state = unsafe { state.as_mut() };
+    let size = if maxDictSize < 0 {
+        64 * 1024
+    } else {
+        (maxDictSize as usize).min(64 * 1024)
+    }
+    .min(state.dict_size as usize);
+    if size != 0 {
+        if safeBuffer.is_null() || state.dictionary == 0 {
+            return 0;
+        }
+        let source = (state.dictionary + state.dict_size as usize - size) as *const u8;
+        unsafe { core::ptr::copy(source, safeBuffer.cast(), size) };
+    }
+    state.dictionary = safeBuffer as usize;
+    state.dict_size = size as u32;
+    size as c_int
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_saveDictHC(streamHCPtr: *mut LZ4_streamHC_t, safeBuffer: *mut c_char, maxDictSize: c_int) -> c_int {
+pub extern "C" fn LZ4_saveDictHC(
+    streamHCPtr: *mut LZ4_streamHC_t,
+    safeBuffer: *mut c_char,
+    maxDictSize: c_int,
+) -> c_int {
     unimplemented!("LZ4_saveDictHC")
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
-pub extern "C" fn LZ4_setCompressionLevel(LZ4_streamHCPtr: *mut LZ4_streamHC_t, compressionLevel: c_int) {
+pub extern "C" fn LZ4_setCompressionLevel(
+    LZ4_streamHCPtr: *mut LZ4_streamHC_t,
+    compressionLevel: c_int,
+) {
     unimplemented!("LZ4_setCompressionLevel")
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_setStreamDecode(LZ4_streamDecode: *mut LZ4_streamDecode_t, dictionary: *const c_char, dictSize: c_int) -> c_int {
-    unimplemented!("LZ4_setStreamDecode")
+pub unsafe extern "C" fn LZ4_setStreamDecode(
+    LZ4_streamDecode: *mut LZ4_streamDecode_t,
+    dictionary: *const c_char,
+    dictSize: c_int,
+) -> c_int {
+    let Some(mut state) = abi_decode_ptr(LZ4_streamDecode) else {
+        return 0;
+    };
+    let state = unsafe { state.as_mut() };
+    if dictSize < 0 || (dictSize != 0 && dictionary.is_null()) {
+        return 0;
+    }
+    state.prefix_size = dictSize as usize;
+    state.prefix_end = (dictionary as usize).saturating_add(dictSize as usize);
+    state.external_dict = 0;
+    state.ext_dict_size = 0;
+    1
 }
 
 /// from lib/lz4.h
@@ -1505,7 +2723,7 @@ pub extern "C" fn LZ4_sizeofStateHC() -> c_int {
 /// from lib/lz4.h
 #[no_mangle]
 pub extern "C" fn LZ4_sizeofStreamState() -> c_int {
-    unimplemented!("LZ4_sizeofStreamState")
+    LZ4_sizeofState()
 }
 
 /// from lib/lz4hc.h
@@ -1517,7 +2735,11 @@ pub extern "C" fn LZ4_sizeofStreamStateHC() -> c_int {
 /// from lib/lz4.h
 #[no_mangle]
 pub extern "C" fn LZ4_slideInputBuffer(state: *mut c_void) -> *mut c_char {
-    unimplemented!("LZ4_slideInputBuffer")
+    if state.is_null() {
+        core::ptr::null_mut()
+    } else {
+        unsafe { (*state.cast::<AbiStreamState>()).dictionary as *mut c_char }
+    }
 }
 
 /// from lib/lz4hc.h
@@ -1528,13 +2750,22 @@ pub extern "C" fn LZ4_slideInputBufferHC(LZ4HC_Data: *mut c_void) -> *mut c_char
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_uncompress(source: *const c_char, dest: *mut c_char, outputSize: c_int) -> c_int {
-    unimplemented!("LZ4_uncompress")
+pub unsafe extern "C" fn LZ4_uncompress(
+    source: *const c_char,
+    dest: *mut c_char,
+    outputSize: c_int,
+) -> c_int {
+    unsafe { LZ4_decompress_fast(source, dest, outputSize) }
 }
 
 /// from lib/lz4.h
 #[no_mangle]
-pub extern "C" fn LZ4_uncompress_unknownOutputSize(source: *const c_char, dest: *mut c_char, isize: c_int, maxOutputSize: c_int) -> c_int {
+pub extern "C" fn LZ4_uncompress_unknownOutputSize(
+    source: *const c_char,
+    dest: *mut c_char,
+    isize: c_int,
+    maxOutputSize: c_int,
+) -> c_int {
     // lz4.c:2818 — deprecated alias.
     LZ4_decompress_safe(source, dest, isize, maxOutputSize)
 }
