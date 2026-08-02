@@ -180,6 +180,64 @@ impl<'a> Input<'a> {
             Input::Within(r) => buf.copy_within(r.start + src_at..r.start + src_at + n, dst_at),
         }
     }
+
+    /// `copy_to` for call sites that have proven spare bytes on both sides:
+    /// this may write up to 7 bytes past `dst_at + n` and read up to 7 past
+    /// `src_at + n`, and always moves at least 8.
+    ///
+    /// `LZ4_wildCopy8` (lz4.c:2350). Both decode call sites sit behind the
+    /// literal parsing restrictions, which reserve `MFLIMIT` (12) output bytes
+    /// and `2+1+LASTLITERALS` (8) input bytes, so neither overshoot leaves the
+    /// buffer. The win is not the copy itself — it is not calling `memcpy` for
+    /// a handful of bytes, which is what a length-dispatched copy costs on the
+    /// short literal runs that dominate real data.
+    ///
+    /// Long runs fall back to `copy_to`; see `WILD_COPY_CUTOFF`.
+    #[inline]
+    fn wild_copy_to(&self, buf: &mut [u8], src_at: usize, dst_at: usize, n: usize) {
+        if n >= WILD_COPY_CUTOFF {
+            self.copy_to(buf, src_at, dst_at, n);
+            return;
+        }
+        let end = dst_at + n;
+        match self {
+            Input::Separate(s) => {
+                let (mut d, mut k) = (dst_at, src_at);
+                loop {
+                    let mut word = [0u8; 8];
+                    word.copy_from_slice(&s[k..k + 8]);
+                    buf[d..d + 8].copy_from_slice(&word);
+                    d += 8;
+                    k += 8;
+                    if d >= end {
+                        return;
+                    }
+                }
+            }
+            Input::Within(r) => {
+                let src = r.start + src_at;
+                // Copying forward in 8-byte chunks reproduces `memmove` only
+                // while the source is at or ahead of the destination — which is
+                // exactly how in-place decompression lays the buffer out
+                // (`LZ4_DECOMPRESS_INPLACE_MARGIN`, lz4.h:672). The other
+                // direction would read bytes an earlier chunk had overwritten,
+                // so it takes the exact path instead.
+                if src < dst_at {
+                    self.copy_to(buf, src_at, dst_at, n);
+                    return;
+                }
+                let (mut d, mut k) = (dst_at, src);
+                loop {
+                    copy8(buf, d, k);
+                    d += 8;
+                    k += 8;
+                    if d >= end {
+                        return;
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -1579,7 +1637,10 @@ pub fn decompress_dict(
         // Entering it skips the parsing-restriction check below, which is a
         // real difference in what gets accepted, not just in speed.
         if length != RUN_MASK as usize && ip < shortiend && op <= shortoend {
-            input.copy_to(buf, ip, op, length);
+            // C copies a fixed 16 bytes here (lz4.c:2246); `length` is at most
+            // 14 on this path, so the two 8-byte steps below cover the same
+            // ground. `shortiend`/`shortoend` reserved the room for both.
+            input.wild_copy_to(buf, ip, op, length);
             op += length;
             ip += length;
 
@@ -1598,7 +1659,25 @@ pub fn decompress_dict(
                 && (prefix_size >= 64 * 1024
                     || op as isize - offset as isize >= low_prefix as isize)
             {
-                copy_match(buf, op, op - offset, match_len + MINMATCH);
+                // C copies a fixed **18** bytes here regardless of the match
+                // length (lz4.c:2262-2264) — the largest a match can be on
+                // this path — because three constant-size stores beat a copy
+                // that has to branch on a length. `shortoend` reserved exactly
+                // those 18 bytes. `offset >= 8` is what makes the second and
+                // third stores legal: each reads only bytes an earlier store
+                // has already finalised.
+                let src = op - offset;
+                if op + 18 <= oend {
+                    copy8(buf, op, src);
+                    copy8(buf, op + 8, src + 8);
+                    let mut pair = [0u8; 2];
+                    pair.copy_from_slice(&buf[src + 16..src + 18]);
+                    buf[op + 16..op + 18].copy_from_slice(&pair);
+                } else {
+                    // `shortoend` saturated on a tiny output buffer, so the 18
+                    // bytes C relies on are not there. Same bytes, no overshoot.
+                    copy_match(buf, op, src, match_len + MINMATCH);
+                }
                 op += match_len + MINMATCH;
                 continue;
             }
@@ -1661,7 +1740,9 @@ pub fn decompress_dict(
                 // in partial mode (caught by a differential run: C returned 13
                 // bytes where we returned 9).
             } else {
-                input.copy_to(buf, ip, op, length);
+                // Neither parsing restriction was hit, so 12 output and 8
+                // input bytes are spare — C's `LZ4_wildCopy8` arm (lz4.c:2350).
+                input.wild_copy_to(buf, ip, op, length);
                 ip += length;
                 op = cpy;
             }
@@ -1770,7 +1851,13 @@ pub fn decompress_dict(
             // match reads back as zeros. The naive copy below would instead
             // leave the destination untouched.
             buf[op..cpy].fill(0);
+        } else if cpy + MATCH_SAFEGUARD_DISTANCE <= oend {
+            // C's fast arm (lz4.c:2450). The same margin it checks is what
+            // makes the overshooting copy legal here.
+            copy_match_wild(buf, op, match_pos, length);
         } else {
+            // Too close to the end to overshoot — C drops to a byte tail at
+            // lz4.c:2447 for the same reason.
             copy_match(buf, op, match_pos, length);
         }
         op = cpy;
@@ -1886,6 +1973,106 @@ pub fn decompress_fast_with(
 /// Isolated in one function so that dictionary support — where a match can
 /// start before the output buffer and straddle the boundary (lz4.c:2384-2401)
 /// — becomes a branch here rather than a change to every caller.
+/// Copy a fixed 8 bytes within `buf`. The size is a constant, so this is a
+/// load/store pair rather than a call into `memmove` — which is the whole point
+/// (see `copy_match_wild`).
+#[inline(always)]
+fn copy8(buf: &mut [u8], dst_at: usize, src_at: usize) {
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&buf[src_at..src_at + 8]);
+    buf[dst_at..dst_at + 8].copy_from_slice(&word);
+}
+
+/// `inc32table` / `dec64table` (lz4.c:475-476), indexed by an offset below 8.
+const INC32_TABLE: [usize; 8] = [0, 1, 2, 1, 0, 4, 4, 4];
+const DEC64_TABLE: [isize; 8] = [0, 0, 0, -1, -4, 1, 2, 3];
+
+/// Writes the first 8 bytes of a match whose offset is 1..=7, and returns the
+/// source index the rest of the copy should continue from.
+///
+/// This is lz4.c:2425-2436. The trick is the two tables: after these 8 bytes
+/// the returned source sits **at least 8 bytes** behind the write position, so
+/// everything after it can proceed a word at a time without reading bytes it is
+/// still writing — which a sub-8 offset otherwise forbids.
+///
+/// The first four bytes must go one at a time, exactly as C writes them: with
+/// an offset below 4, each byte read here was written by the previous
+/// iteration, and that self-reference *is* the repeat the format encodes.
+/// The second four are a bulk copy, because the adjusted source is disjoint
+/// from them for every offset in range.
+#[inline]
+fn short_offset_prologue(
+    buf: &mut [u8],
+    dst_at: usize,
+    match_at: usize,
+    offset: usize,
+) -> usize {
+    for i in 0..4 {
+        buf[dst_at + i] = buf[match_at + i];
+    }
+    let src = match_at + INC32_TABLE[offset];
+    let mut word = [0u8; 4];
+    word.copy_from_slice(&buf[src..src + 4]);
+    buf[dst_at + 4..dst_at + 8].copy_from_slice(&word);
+    (src as isize - DEC64_TABLE[offset]) as usize
+}
+
+/// Below this length a run is copied in fixed 8-byte steps; at or above it, by
+/// `memcpy`/`memmove`. Applies to both literal runs and matches.
+///
+/// Both directions are worth having, and the measurements say so. On the few
+/// bytes a typical sequence moves, the call into `memcpy` costs more than the
+/// copy itself and C's fixed-width stores win — paying for that call per
+/// sequence is what left decompression at 0.2–0.4x of C. On long runs the
+/// reverse holds by a wide margin: `memcpy` moves far more than 8 bytes per
+/// step and amortises its dispatch. On 8 MB of zeroes — one enormous offset-1
+/// match — `LZ4_decompress_safe` reaches 2.7x the C library, because C is
+/// still stepping 8 bytes at a time where we hand whole megabytes to `memmove`.
+///
+/// The exact value is not sensitive: measured at 16, 32, 64, 128 and 512 over
+/// four inputs, the spread sits inside this host's ~13% run-to-run noise.
+/// Only removing the cutoff is clearly wrong — it cost about a third of the
+/// decode throughput on literal-heavy data. C needs no such split, because its
+/// `LZ4_wildCopy8` has no per-step bounds check to amortise.
+const WILD_COPY_CUTOFF: usize = 32;
+
+/// `copy_match` for call sites that have proven at least
+/// `MATCH_SAFEGUARD_DISTANCE` writable bytes past `dst_at + len`.
+///
+/// It may write up to 7 bytes beyond the match — C's `LZ4_wildCopy8` bargain
+/// (lz4.c:466): trading a few dead bytes for a copy loop with no length
+/// dispatch and no call. Every byte that *belongs* to the match is identical to
+/// what `copy_match` would have written; the slack bytes are overwritten by
+/// whatever the decoder emits next.
+#[inline]
+fn copy_match_wild(buf: &mut [u8], dst_at: usize, match_at: usize, len: usize) {
+    let offset = dst_at - match_at;
+    if offset == 0 || len == 0 {
+        return;
+    }
+    if len >= WILD_COPY_CUTOFF {
+        copy_match(buf, dst_at, match_at, len);
+        return;
+    }
+    let end = dst_at + len;
+    let (mut d, mut s) = (dst_at, match_at);
+    if offset < 8 {
+        s = short_offset_prologue(buf, dst_at, match_at, offset);
+        d = dst_at + 8;
+        if d >= end {
+            return;
+        }
+    }
+    loop {
+        copy8(buf, d, s);
+        d += 8;
+        s += 8;
+        if d >= end {
+            return;
+        }
+    }
+}
+
 #[inline]
 fn copy_match(buf: &mut [u8], dst_at: usize, match_at: usize, len: usize) {
     let offset = dst_at - match_at;
