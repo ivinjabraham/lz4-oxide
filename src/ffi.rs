@@ -163,7 +163,7 @@ unsafe fn compress_continue_impl(
     force_external: bool,
 ) -> c_int {
     if src_size < 0
-        || dst_capacity <= 0
+        || dst_capacity < 0
         || (src_size != 0 && src.is_null())
         || dst.is_null()
         || stream.is_null()

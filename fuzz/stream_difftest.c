@@ -129,5 +129,10 @@ int main(void) {
     emit_int(LZ4_compress_fast_continue(
         stream, input, compressed[0], BLOCK_SIZE, 1, 1));
     emit_state(stream);
+    LZ4_resetStream(stream);
+    emit_int(LZ4_loadDict(stream, dictionary, DICT_SIZE));
+    emit_int(LZ4_compress_fast_continue(
+        stream, input, compressed[0], BLOCK_SIZE, 0, 1));
+    emit_state(stream);
     return 0;
 }

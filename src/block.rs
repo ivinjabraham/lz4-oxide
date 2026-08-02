@@ -58,6 +58,7 @@ const HASHLOG: u32 = LZ4_MEMORY_USAGE_PROBED as u32 - 2;
 const U32_ENTRIES: usize = 1 << HASHLOG;
 /// `byU16` gets one extra bit of hash (lz4.c:789, :796).
 const U16_ENTRIES: usize = 1 << (HASHLOG + 1);
+const ABI_STREAM_PADDING_WORDS: usize = if usize::BITS == 32 { 3 } else { 1 };
 
 /// lz4.h:215 — exact formula; do not approximate.
 ///
@@ -296,7 +297,7 @@ pub struct AbiStreamState {
     pub current_offset: u32,
     pub table_type: u32,
     pub dict_size: u32,
-    pub padding: u32,
+    pub padding: [u32; ABI_STREAM_PADDING_WORDS],
 }
 
 /// Exact allocation-free mirror of `LZ4_streamDecode_t_internal`.
@@ -417,7 +418,7 @@ impl AbiStreamState {
         self.current_offset = 0;
         self.table_type = 0;
         self.dict_size = 0;
-        self.padding = 0;
+        self.padding.fill(0);
     }
 
     pub fn reset_fast(&mut self) {
@@ -1802,7 +1803,7 @@ mod streaming_tests {
             current_offset: 0,
             table_type: 0,
             dict_size: 0,
-            padding: 0,
+            padding: [0; ABI_STREAM_PADDING_WORDS],
         }
     }
 
