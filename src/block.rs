@@ -1639,9 +1639,24 @@ pub fn decompress_dict(
         return Err(Error::Malformed { consumed: 0 });
     }
 
-    // lz4.c:2050-2051 — the shortcut's margins.
-    let shortiend = iend.saturating_sub(14 /*maxLL*/ + 2 /*offset*/);
-    let shortoend = oend.saturating_sub(14 /*maxLL*/ + 18 /*maxML*/);
+    // lz4.c:2050-2051 — the shortcut's margins, as C compares them but written
+    // additively.
+    //
+    // C forms `oend - 32` and `iend - 16` as *pointers* and tests `op <=
+    // shortoend` / `ip < shortiend`. On a block smaller than the margin those
+    // land before the buffer, so no `op` can satisfy the test and the shortcut
+    // is simply unavailable. `saturating_sub` does not reproduce that: it
+    // clamps to 0, and `op <= 0` is **true** for the first sequence of a block
+    // written at offset 0 — so the shortcut ran on buffers far too small for
+    // its 32-byte margin, `op` walked past `oend`, and `length = oend - op`
+    // underflowed. `LZ4_decompress_safe_partial` with a small
+    // `targetOutputSize` reached it: `fuzzer -i2000 -s7354` died with
+    // "slice index starts at 21 but ends at 7" on a 7-byte output buffer.
+    //
+    // Adding to the left-hand side instead cannot underflow and needs no
+    // clamp, so the comparison is exactly C's.
+    const SHORT_IN_MARGIN: usize = 14 /*maxLL*/ + 2 /*offset*/;
+    const SHORT_OUT_MARGIN: usize = 14 /*maxLL*/ + 18 /*maxML*/;
 
     loop {
         // --- token ---
@@ -1655,10 +1670,13 @@ pub fn decompress_dict(
         // --- two-stage shortcut (lz4.c:2241-2272) ---
         // Entering it skips the parsing-restriction check below, which is a
         // real difference in what gets accepted, not just in speed.
-        if length != RUN_MASK as usize && ip < shortiend && op <= shortoend {
+        if length != RUN_MASK as usize
+            && ip + SHORT_IN_MARGIN < iend
+            && op + SHORT_OUT_MARGIN <= oend
+        {
             // C copies a fixed 16 bytes here (lz4.c:2246); `length` is at most
             // 14 on this path, so the two 8-byte steps below cover the same
-            // ground. `shortiend`/`shortoend` reserved the room for both.
+            // ground. The margins tested above reserved the room for both.
             input.wild_copy_to(buf, ip, op, length);
             op += length;
             ip += length;
@@ -1681,22 +1699,19 @@ pub fn decompress_dict(
                 // C copies a fixed **18** bytes here regardless of the match
                 // length (lz4.c:2262-2264) — the largest a match can be on
                 // this path — because three constant-size stores beat a copy
-                // that has to branch on a length. `shortoend` reserved exactly
-                // those 18 bytes. `offset >= 8` is what makes the second and
-                // third stores legal: each reads only bytes an earlier store
-                // has already finalised.
+                // that has to branch on a length. `offset >= 8` is what makes
+                // the second and third stores legal: each reads only bytes an
+                // earlier store has already finalised.
+                //
+                // The room is guaranteed, not hoped for: entry required
+                // `op + 32 <= oend`, and the literal copy above advanced `op`
+                // by at most 14, so `op + 18 <= oend` holds here.
                 let src = op - offset;
-                if op + 18 <= oend {
-                    copy8(buf, op, src);
-                    copy8(buf, op + 8, src + 8);
-                    let mut pair = [0u8; 2];
-                    pair.copy_from_slice(&buf[src + 16..src + 18]);
-                    buf[op + 16..op + 18].copy_from_slice(&pair);
-                } else {
-                    // `shortoend` saturated on a tiny output buffer, so the 18
-                    // bytes C relies on are not there. Same bytes, no overshoot.
-                    copy_match(buf, op, src, match_len + MINMATCH);
-                }
+                copy8(buf, op, src);
+                copy8(buf, op + 8, src + 8);
+                let mut pair = [0u8; 2];
+                pair.copy_from_slice(&buf[src + 16..src + 18]);
+                buf[op + 16..op + 18].copy_from_slice(&pair);
                 op += match_len + MINMATCH;
                 continue;
             }
@@ -1728,9 +1743,18 @@ pub fn decompress_dict(
 
             // --- copy literals (lz4.c:2289-2352) ---
             let mut cpy = op + length;
-            if cpy > oend.saturating_sub(MFLIMIT)
-                || ip + length > iend.saturating_sub(2 + 1 + LASTLITERALS)
-            {
+            // Additive, for the reason given at `SHORT_OUT_MARGIN`: C compares
+            // `cpy > oend - MFLIMIT` as pointers, and on a block shorter than
+            // `MFLIMIT` that bound sits before `dst`, so the test is *true* and
+            // the restricted branch below runs. `oend.saturating_sub(MFLIMIT)`
+            // clamps to 0 instead, and `cpy > 0` is false for a zero-length
+            // literal run — which sent a 1-byte output buffer down the
+            // unrestricted branch. That was harmless while the branch held an
+            // exact `memcpy`; once it became a wildcopy that always moves 8
+            // bytes, it wrote past a 1-byte buffer. Found by rejection-parity
+            // sweep: `difftest q 1 1` on a block whose first byte was corrupted
+            // to 0x00, where C returns -4 and we panicked.
+            if cpy + MFLIMIT > oend || ip + length + (2 + 1 + LASTLITERALS) > iend {
                 // Either the input or the output parsing restriction was hit.
                 // For a well-formed full block this must be the final sequence.
                 if partial {
