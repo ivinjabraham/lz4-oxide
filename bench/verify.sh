@@ -3,16 +3,21 @@
 # library and against the Rust port, over a spread of sizes/compressibilities.
 # Any divergence here is a parse difference the round-trip tests cannot see.
 set -u
-cd /home/ivin/lz4-oxide
-SP="$(cd "$(dirname "$0")" && pwd)"
+# Resolve our own location BEFORE cd-ing, and keep every artefact in $WORK
+# rather than the repo -- $0 is relative, so resolving it afterwards used to
+# scatter test binaries and samples into whatever directory this ran from.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SP="${LZ4_BENCH_WORK:-${TMPDIR:-/tmp}/lz4-oxide-bench}"
+mkdir -p "$SP"
+cd "$ROOT" || exit 1
 LIBS="-lgcc_s -lutil -lrt -lpthread -lm -ldl -lc"
 
 make -C upstream/lib liblz4.a >/dev/null 2>&1
 make -C upstream/tests datagen >/dev/null 2>&1
 
 for h in difftest stream_difftest framediff; do
-  gcc -O2 -I upstream/lib fuzz/$h.c upstream/lib/liblz4.a           -o $SP/$h-c  || exit 1
-  gcc -O2 -I upstream/lib fuzz/$h.c target/release/liblz4_rs.a $LIBS -o $SP/$h-rs || exit 1
+  gcc -O2 -I upstream/lib "fuzz/$h.c" upstream/lib/liblz4.a           -o $SP/$h-c  || exit 1
+  gcc -O2 -I upstream/lib "fuzz/$h.c" target/release/liblz4_rs.a $LIBS -o $SP/$h-rs || exit 1
 done
 
 fail=0; pass=0

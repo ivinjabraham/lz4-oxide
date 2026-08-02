@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -e
 source "$HOME/.cargo/env"
-cd /home/ivin/lz4-oxide
-SP="$(cd "$(dirname "$0")" && pwd)"
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SP="${LZ4_BENCH_WORK:-${TMPDIR:-/tmp}/lz4-oxide-bench}"
+mkdir -p "$SP"
 cargo build --release >/dev/null
 rm -f upstream/tests/cachedObjs/*/fullbench upstream/tests/fullbench
 make -C upstream/tests fullbench \

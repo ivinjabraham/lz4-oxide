@@ -3,7 +3,9 @@
 # Reports best-of-N: run-to-run spread on this host is ~13%, so a single run
 # cannot resolve anything smaller than that, and the max is the least
 # noise-sensitive summary of a throughput measurement.
-SP="$(cd "$(dirname "$0")" && pwd)"
+# See verify.sh: resolve before any cd, and keep artefacts out of the repo.
+SP="${LZ4_BENCH_WORK:-${TMPDIR:-/tmp}/lz4-oxide-bench}"
+mkdir -p "$SP"
 FILE="${1:-$SP/d50.bin}"
 ALGOS="${2:-c1 c9 d1 d4 d6}"
 REPS="${3:-3}"
