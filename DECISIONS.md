@@ -504,6 +504,82 @@ and fast level -3): **120 comparisons, all byte-identical.**
 
 ---
 
+## 8.2 HC: `lz4mid` is ported, the two parsers above it are not
+
+`lz4hc.c:420-436` picks one of three match finders by level, and `src/hc.rs`
+implements the first of them:
+
+| Level | C strategy | Ported | Byte-identical to C |
+|---|---|---|---|
+| 1-2 | `lz4mid` | ✅ yes | ✅ **yes**, verified |
+| 3-9 | `lz4hc` (hash chain) | ❌ no | ❌ no — routed to `lz4mid` |
+| 10-12 | `lz4opt` (optimal parser) | ❌ no | ❌ no — routed to `lz4mid` |
+
+This is the **"degrade, don't delete"** fallback named in PLAN.md §6.1, applied
+in the other direction than that section anticipated: rather than routing 10-12
+down to the level-9 hash chain, every level above 2 currently lands on `lz4mid`.
+The consequence is the same in kind — the output is well-formed LZ4 that
+round-trips and passes every CRC check in the suite, so `fuzzer` and `frametest`
+are green at all 13 levels — but a caller asking for level 9 gets level-2
+compression. Concretely, on 120 KB of 4-symbol noise: C emits 49,277 bytes at
+level 9 and 46,773 at level 11, where we emit 56,424 at every level.
+
+**What this costs.** Behavioural equivalence is 30% of the score, and levels 3-12
+are 11 of the 13 reachable values. `fuzzer.c:386` draws the level once per cycle
+and reuses it across ~15 HC call sites, so most cycles compress through a
+strategy whose *bytes* we do not reproduce — they are merely valid. Nothing in
+the upstream suite detects this, which is exactly why it is written down here:
+round-trip tests cannot see it, and `fuzz/hc_difftest.c` deliberately compares
+only levels 1-2 rather than reporting a failure it cannot fix.
+
+**The one thing not to do** is treat the green suite as done. Finishing this
+means porting `LZ4HC_compress_hashChain` (with `LZ4HC_InsertAndGetWiderMatch`,
+the chain-swap and pattern-analysis paths) and `LZ4HC_compress_optimal`, plus the
+`chainTable` maintenance in `LZ4HC_Insert` — which `set_external_dict` and
+`LZ4_loadDictHC` also skip today, since no chain exists to maintain. Both skips
+are marked at their call sites in `src/ffi.rs` and `src/hc.rs`.
+
+### What *is* verified for levels 1-2
+
+The trap in porting `lz4mid` is that `LZ4HC_CCtx_internal` describes positions
+twice over: `prefixStart .. end` is one **contiguous** buffer holding the history
+followed by the current block, while `dictLimit`/`lowLimit` give the same bytes
+rising absolute indices. `LZ4_count` walks straight across the history/block
+seam and the catch-back loop reads backwards through it, so representing the two
+as separate slices changes which matches are found — invisibly, since the result
+still round-trips. `src/hc.rs` therefore takes one `SrcView::base` slice plus the
+block's offset within it, and the module header says so.
+
+Two smaller places where following C exactly matters, both commented in place:
+
+- The "fill table with beginning of match" writes use the `ipIndex` from the top
+  of the loop while `ip` itself has already moved (the `ip+1` peek and the
+  catch-back), so the stored index can disagree with the position hashed.
+  Faithful, and load-bearing.
+- `LZ4HC_compress_generic`'s dictCtx dispatch reads `position` **before**
+  `ctx->end += *srcSizePtr`. Computing it afterwards silently selects the wrong
+  arm; that bug survived a 12,000-case round-trip sweep and was caught only by
+  byte-comparison against C.
+
+### How byte-identity was checked
+
+`fuzz/hc_difftest.c` compiles twice — against `upstream/lib/liblz4.a` and
+against `target/release/liblz4_rs.a` — and emits a binary transcript of the
+whole HC surface: one-shot at generous/exact/one-byte-short capacity, external
+state fresh and fast-reset, streaming with a loaded dictionary, `saveDictHC`,
+both `destSize` (fillOutput) entry points across a range of capacities, and
+compression against an attached dictionary context. Failures and the
+`srcSizePtr` written back by the fillOutput calls are emitted too, so the
+comparison covers **rejection parity and how much input was consumed**, not just
+agreement on valid output. The `dictLimit`/`lowLimit`/`nextToUpdate`/`dirty`
+bookkeeping is emitted after each streaming call; pointers are not, being
+addresses rather than behaviour.
+
+Run over `datagen` output at 20 KB / 300 KB / 1 MB, each at `-P10/50/90`, at
+levels 1 and 2: **18 transcripts, all byte-identical** (`fuzz/driver.sh`).
+
+---
+
 ## 9. Open items
 
 - [ ] **Build the Dockerfile once.** It was written on a host without Docker,
@@ -512,7 +588,15 @@ and fast level -3): **120 comparisons, all byte-identical.**
 - [ ] Fill in `unimplemented!()` stubs (see §4); order of work in `PLAN.md` §6
 - [ ] **Frame contexts: move the working buffers into the caller's allocator**
       (§8.1). One `frametest` unit assertion depends on it.
+- [ ] **One live bug in `src/block.rs`, *outside* the HC work of §8.2:**
+      - Segfault in decompressor #5, `LZ4_decompress_safe_withPrefix64k`:
+        `./upstream/tests/fullbench -d5 -i1 upstream/tests/COPYING` dies, which
+        is what stops `make test` at `test-fullbench`. Present before the HC
+        work (confirmed by stashing it and rebuilding), so it is a phase-2/4
+        decode-path defect, not a regression.
 - [ ] Differential fuzz harness (C reference vs Rust, valid **and** malformed input)
+      — `fuzz/hc_difftest.c` covers the HC surface (§8.2); the generic block and
+      malformed-input halves are still missing
 - [ ] Benchmark report: p99, RSS, startup, with methodology
 - [ ] Paste organisers' eligibility ruling (§2)
 - [x] Confirm `LZ4F_compressOptions_t` / `LZ4F_decompressOptions_t` layouts

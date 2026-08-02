@@ -848,11 +848,14 @@ fn compress_generic(
         // each case. It never crosses between the two regions, which is why a
         // single index comparison suffices.
         let filled_ip = ip;
-        let active_hist = if directive == DictDirective::UsingDictCtx && match_in_dict {
-            context_hist.as_ref().expect("dictionary context")
-        } else {
-            &hist
+        let pick_hist = |in_dict: bool| -> &Hist {
+            if directive == DictDirective::UsingDictCtx && in_dict {
+                context_hist.as_ref().expect("dictionary context")
+            } else {
+                &hist
+            }
         };
+        let active_hist = pick_hist(match_in_dict);
         let low_limit: u32 = if match_in_dict {
             active_hist.dict_base_index()
         } else if directive == DictDirective::WithPrefix64k {
@@ -914,6 +917,14 @@ fn compress_generic(
         // `_next_match` (lz4.c:1147). Re-entered without re-encoding literals
         // when the very next position also matches.
         loop {
+            // Re-derived every iteration, not hoisted: the "test next position"
+            // tail below reassigns `match_in_dict`, and under `UsingDictCtx` the
+            // two arms are *different* histories. C re-points `lowLimit` at the
+            // same moment (lz4.c:1272,1276) and comments that it is "required
+            // for match length counter". Reading a dictCtx match against `hist`
+            // — whose `dict_size` is 0 in that mode — wraps `dict_at` into a
+            // ~4 G index. Reached from `fuzzer -i60 -s9`, cycle 54.
+            let active_hist = pick_hist(match_in_dict);
             if fill && op + 2 + 1 + MFLIMIT - MINMATCH > olimit {
                 return last_literals(
                     buf, input, anchor, iend, token, olimit, true, true, consumed, dst.start,
@@ -1033,11 +1044,7 @@ fn compress_generic(
                     .get(h)
                     .wrapping_add(start_index.wrapping_sub(context.current_offset));
             }
-            let next_hist = if directive == DictDirective::UsingDictCtx && in_dict {
-                context_hist.as_ref().expect("dictionary context")
-            } else {
-                &hist
-            };
+            let next_hist = pick_hist(in_dict);
             let near_enough =
                 if tt == TableType::U16 && LZ4_DISTANCE_MAX == LZ4_DISTANCE_ABSOLUTE_MAX {
                     true
