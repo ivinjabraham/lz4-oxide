@@ -504,6 +504,132 @@ and fast level -3): **120 comparisons, all byte-identical.**
 
 ---
 
+## 8.2 HC: `lz4mid` is ported, the two parsers above it are not
+
+`lz4hc.c:420-436` picks one of three match finders by level, and `src/hc.rs`
+implements the first of them:
+
+| Level | C strategy | Ported | Byte-identical to C |
+|---|---|---|---|
+| 1-2 | `lz4mid` | ✅ yes | ✅ **yes**, verified |
+| 3-9 | `lz4hc` (hash chain) | ❌ no | ❌ no — routed to `lz4mid` |
+| 10-12 | `lz4opt` (optimal parser) | ❌ no | ❌ no — routed to `lz4mid` |
+
+This is the **"degrade, don't delete"** fallback named in PLAN.md §6.1, applied
+in the other direction than that section anticipated: rather than routing 10-12
+down to the level-9 hash chain, every level above 2 currently lands on `lz4mid`.
+The consequence is the same in kind — the output is well-formed LZ4 that
+round-trips and passes every CRC check in the suite, so `fuzzer` and `frametest`
+are green at all 13 levels — but a caller asking for level 9 gets level-2
+compression. Concretely, on 120 KB of 4-symbol noise: C emits 49,277 bytes at
+level 9 and 46,773 at level 11, where we emit 56,424 at every level.
+
+**What this costs.** Behavioural equivalence is 30% of the score, and levels 3-12
+are 11 of the 13 reachable values. `fuzzer.c:386` draws the level once per cycle
+and reuses it across ~15 HC call sites, so most cycles compress through a
+strategy whose *bytes* we do not reproduce — they are merely valid. Nothing in
+the upstream suite detects this, which is exactly why it is written down here:
+round-trip tests cannot see it, and `fuzz/hc_difftest.c` deliberately compares
+only levels 1-2 rather than reporting a failure it cannot fix.
+
+**The one thing not to do** is treat the green suite as done. Finishing this
+means porting `LZ4HC_compress_hashChain` (with `LZ4HC_InsertAndGetWiderMatch`,
+the chain-swap and pattern-analysis paths) and `LZ4HC_compress_optimal`, plus the
+`chainTable` maintenance in `LZ4HC_Insert` — which `set_external_dict` and
+`LZ4_loadDictHC` also skip today, since no chain exists to maintain. Both skips
+are marked at their call sites in `src/ffi.rs` and `src/hc.rs`.
+
+### What *is* verified for levels 1-2
+
+The trap in porting `lz4mid` is that `LZ4HC_CCtx_internal` describes positions
+twice over: `prefixStart .. end` is one **contiguous** buffer holding the history
+followed by the current block, while `dictLimit`/`lowLimit` give the same bytes
+rising absolute indices. `LZ4_count` walks straight across the history/block
+seam and the catch-back loop reads backwards through it, so representing the two
+as separate slices changes which matches are found — invisibly, since the result
+still round-trips. `src/hc.rs` therefore takes one `SrcView::base` slice plus the
+block's offset within it, and the module header says so.
+
+Two smaller places where following C exactly matters, both commented in place:
+
+- The "fill table with beginning of match" writes use the `ipIndex` from the top
+  of the loop while `ip` itself has already moved (the `ip+1` peek and the
+  catch-back), so the stored index can disagree with the position hashed.
+  Faithful, and load-bearing.
+- `LZ4HC_compress_generic`'s dictCtx dispatch reads `position` **before**
+  `ctx->end += *srcSizePtr`. Computing it afterwards silently selects the wrong
+  arm; that bug survived a 12,000-case round-trip sweep and was caught only by
+  byte-comparison against C.
+
+### How byte-identity was checked
+
+`fuzz/hc_difftest.c` compiles twice — against `upstream/lib/liblz4.a` and
+against `target/release/liblz4_rs.a` — and emits a binary transcript of the
+whole HC surface: one-shot at generous/exact/one-byte-short capacity, external
+state fresh and fast-reset, streaming with a loaded dictionary, `saveDictHC`,
+both `destSize` (fillOutput) entry points across a range of capacities, and
+compression against an attached dictionary context. Failures and the
+`srcSizePtr` written back by the fillOutput calls are emitted too, so the
+comparison covers **rejection parity and how much input was consumed**, not just
+agreement on valid output. The `dictLimit`/`lowLimit`/`nextToUpdate`/`dirty`
+bookkeeping is emitted after each streaming call; pointers are not, being
+addresses rather than behaviour.
+
+Run over `datagen` output at 20 KB / 300 KB / 1 MB, each at `-P10/50/90`, at
+levels 1 and 2: **18 transcripts, all byte-identical** (`fuzz/driver.sh`).
+
+---
+
+## 8.3 The prefix decode path: history must not be *read*, only addressed
+
+`LZ4_decompress_safe_withPrefix64k` and the prefix arm of
+`LZ4_decompress_safe{,_partial}_usingDict` segfaulted — `fullbench`
+decompressors #5, #6 and #8 — because `decompress_safe_histories` staged the
+decode through a scratch `Vec`: allocate `prefix_size + output_size`, **copy the
+prefix in**, decode, copy the result back out.
+
+The copy is the bug. C's decoder never reads the history up front; it reads a
+byte of it only when a match offset actually reaches back that far. The two
+differ whenever the prefix is nominally addressable but not really there, and
+that is not a corner case the suite stumbled into by accident —
+`fullbench.c:320` calls
+
+```c
+LZ4_decompress_safe_withPrefix64k(in, out, inSize, outSize);   /* out == orig_buff */
+```
+
+with `out` the head of a `malloc(benchedSize)`. The 64 KB "prefix" before it is
+unmapped. C is fine, because `fullbench` compressed that data with no
+dictionary, so no offset points below `out`. We touched all 65,536 bytes and
+died. Note that C is *also* reading a pointer it has no right to form here —
+this is arguably a latent bug in the harness — but the contract we owe is
+behavioural equivalence, and C's laziness makes it unobservable.
+
+The fix is to stop materialising the prefix and address it in place. A prefix is
+contiguous with `dst` **by definition** — it is the mode C selects exactly when
+`dictStart + dictSize == dst` — so one slice spans `[dst - prefix_size,
+dst + output_size)` with the block at offset `prefix_size`, and `low_prefix`
+arithmetic in `decompress_dict` already handles the rest unchanged. No scratch
+buffer, no copy back, and one fewer allocation per call on the hot path.
+
+The overlap case still needs care: `src` may lie *inside* the output allocation
+(in-place decompression, `LZ4_DECOMPRESS_INPLACE_BUFFER_SIZE`), and holding
+`&[u8]` and `&mut [u8]` over the same bytes is UB. That branch spans both
+regions into one slice and indexes in, the same trick `with_buffers` uses.
+
+**How it was checked.** `fuzzer -i3000`, `frametest -i50`, and all 13 `fullbench`
+decompressors (which CRC-check their output) are green, and `make test` passes
+end to end. For the paths this touches, a differential harness compiled twice —
+against `upstream/lib/liblz4.a` and against `target/release/liblz4_rs.a` —
+compares prefix mode, `withPrefix64k`, partial-in-prefix mode, external dict,
+in-place-with-prefix, and four malformed inputs, over six PRNG seeds and four
+sizes: **270 transcript lines, byte-identical, including the negative return
+values.** Round-trip alone would not have caught the original defect (it
+crashed rather than mis-decoded), but rejection parity is the half that silently
+drifts, so the return codes are in the transcript too.
+
+---
+
 ## 9. Open items
 
 - [ ] **Build the Dockerfile once.** It was written on a host without Docker,
@@ -512,7 +638,12 @@ and fast level -3): **120 comparisons, all byte-identical.**
 - [ ] Fill in `unimplemented!()` stubs (see §4); order of work in `PLAN.md` §6
 - [ ] **Frame contexts: move the working buffers into the caller's allocator**
       (§8.1). One `frametest` unit assertion depends on it.
+- [x] **Segfault in the prefix decode path — fixed (2026-08-02), see §8.3.**
+      Killed decompressors #5/#6/#8 in `fullbench` and stopped `make test` at
+      `test-fullbench`. `make test` now exits 0 end to end.
 - [ ] Differential fuzz harness (C reference vs Rust, valid **and** malformed input)
+      — `fuzz/hc_difftest.c` covers the HC surface (§8.2); the generic block and
+      malformed-input halves are still missing
 - [ ] Benchmark report: p99, RSS, startup, with methodology
 - [ ] Paste organisers' eligibility ruling (§2)
 - [x] Confirm `LZ4F_compressOptions_t` / `LZ4F_decompressOptions_t` layouts

@@ -96,6 +96,235 @@ fn abi_decode_ptr(stream: *mut LZ4_streamDecode_t) -> Option<core::ptr::NonNull<
     }
 }
 
+// --- HC (lz4hc.c) plumbing -------------------------------------------------
+//
+// The HC context stores three raw addresses — `prefixStart`, `end` and
+// `dictStart`. C dereferences them directly; `crate::hc` is safe code, so this
+// is where they are turned back into slices. Two shapes matter:
+//
+//   * `[prefixStart, end)` is *one* contiguous buffer: the history followed by
+//     the block being compressed. Matches and the catch-back loop cross that
+//     seam freely, so `hc::SrcView` gets a single slice covering both, plus the
+//     block's offset within it. Splitting them would silently change output.
+//   * `dictStart`, covering indices `[lowLimit, dictLimit)`, is a separate
+//     allocation and stays its own slice.
+
+/// Borrow `[prefixStart, end + srcSize)` and the external dictionary as one
+/// [`hc::SrcView`], then run the requested strategy over it.
+///
+/// This is the tail shared by every HC compression entry point: it performs
+/// `ctx->end += *srcSizePtr` (lz4hc.c:1440) and the dictCtx dispatch of
+/// `LZ4HC_compress_generic` (lz4hc.c:1522).
+///
+/// # Safety
+///
+/// `src` must be valid for `src_size` bytes and `dst` for `dst_capacity`. The
+/// context's pointer fields must describe live memory, with `prefixStart <= end`
+/// and `end == src` unless the caller has already called `set_external_dict`.
+unsafe fn hc_compress_generic(
+    s: &mut crate::hc::HcState,
+    src: *const c_char,
+    dst: *mut c_char,
+    src_size: c_int,
+    dst_capacity: c_int,
+    level: c_int,
+    limit: crate::hc::Limit,
+) -> (usize, usize) {
+    // --- LZ4HC_compress_generic (lz4hc.c:1522) ---
+    //
+    // The dictCtx dispatch runs *before* `ctx->end += *srcSizePtr`, so
+    // `position` must be read while `end` still points at the end of the
+    // history. Computing it afterwards silently changes which arm is taken.
+    let mut use_dict_ctx = false;
+    if s.dict_ctx != 0 {
+        // LZ4HC_compress_generic_dictCtx (lz4hc.c:1491).
+        let position = (s.end - s.prefix_start) + (s.dict_limit - s.low_limit) as usize;
+        if position >= 64 * 1024 {
+            s.dict_ctx = 0;
+        } else {
+            let d = unsafe { hc_dict_ctx(s.dict_ctx) };
+            if position == 0
+                && src_size > 4 * 1024
+                && crate::hc::is_mid_level(s.compression_level as c_int)
+                    == crate::hc::is_mid_level(d.compression_level as c_int)
+            {
+                // C copies the whole dictionary context over ours — tables
+                // included — then re-bases it onto this block and continues
+                // down the noDictCtx path.
+                s.copy_from_dict_ctx(&d);
+                s.set_external_dict(src as usize);
+                s.compression_level = level as i16;
+            } else {
+                use_dict_ctx = true;
+            }
+        }
+    }
+
+    let dst_sl =
+        unsafe { core::slice::from_raw_parts_mut(dst as *mut u8, dst_capacity as usize) };
+
+    // `[prefixStart, end)` is the history; the block extends it to `end + srcSize`.
+    // C: ctx->end += *srcSizePtr (lz4hc.c:1440).
+    let src_off = s.end.wrapping_sub(s.prefix_start);
+    s.end = s.end.wrapping_add(src_size as usize);
+    let base = unsafe {
+        core::slice::from_raw_parts(s.prefix_start as *const u8, src_off + src_size as usize)
+    };
+
+    let dict_len = s.dict_limit.wrapping_sub(s.low_limit) as usize;
+    let dict: &[u8] = if s.dict_start != 0 && dict_len > 0 {
+        unsafe { core::slice::from_raw_parts(s.dict_start as *const u8, dict_len) }
+    } else {
+        &[]
+    };
+
+    let view = crate::hc::SrcView {
+        base,
+        src_off,
+        prefix_idx: s.dict_limit,
+        dict,
+        dict_idx: s.low_limit,
+    };
+
+    let d = if use_dict_ctx {
+        Some(unsafe { hc_dict_ctx(s.dict_ctx) })
+    } else {
+        None
+    };
+    crate::hc::compress_generic_internal(s, &view, dst_sl, limit, d.as_ref())
+}
+
+/// Borrow the `LZ4HC_CCtx_internal` attached by `LZ4_attach_HC_dictionary` as a
+/// [`hc::MidDictCtx`], including its prefix bytes `[prefixStart, end)`.
+///
+/// # Safety
+///
+/// `addr` must be a live, initialised `LZ4HC_CCtx_internal` whose
+/// `prefixStart`/`end` describe live memory.
+unsafe fn hc_dict_ctx(addr: usize) -> crate::hc::MidDictCtx<'static> {
+    let d = unsafe { &*(addr as *const crate::hc::HcState) };
+    let prefix_len = d.end.wrapping_sub(d.prefix_start);
+    let prefix: &[u8] = if d.prefix_start != 0 && prefix_len > 0 {
+        unsafe { core::slice::from_raw_parts(d.prefix_start as *const u8, prefix_len) }
+    } else {
+        &[]
+    };
+    crate::hc::MidDictCtx {
+        hash_table: &d.hash_table,
+        chain_table: &d.chain_table,
+        end: d.end,
+        prefix_start: d.prefix_start,
+        dict_start: d.dict_start,
+        dict_limit: d.dict_limit,
+        low_limit: d.low_limit,
+        next_to_update: d.next_to_update,
+        compression_level: d.compression_level,
+        favor_dec_speed: d.favor_dec_speed,
+        dirty: d.dirty,
+        dict_ctx: d.dict_ctx,
+        prefix,
+    }
+}
+
+/// Shared implementation for the deprecated `LZ4_compressHC2*_continue`
+/// functions, which take a raw `*mut c_void` state (lz4hc.c:2238, :2243).
+///
+/// Unlike `LZ4_compress_HC_continue` these call `LZ4HC_compress_generic`
+/// directly: no auto-init, no external-dict handling, no `srcSize` bound check
+/// against `dstCapacity`.
+fn hc_compress_generic_raw(
+    state: *mut c_void,
+    src: *const c_char,
+    dst: *mut c_char,
+    src_size: c_int,
+    dst_capacity: c_int,
+    level: c_int,
+    limit: crate::hc::Limit,
+) -> c_int {
+    if state.is_null()
+        || src_size < 0
+        || dst_capacity < 0
+        || (src_size != 0 && src.is_null())
+        || dst.is_null()
+    {
+        return 0;
+    }
+    let s = unsafe { &mut *state.cast::<crate::hc::HcState>() };
+    if s.prefix_start == 0 {
+        s.init_internal(src as usize);
+    }
+    if src as usize != s.end {
+        s.set_external_dict(src as usize);
+    }
+    let (written, _) =
+        unsafe { hc_compress_generic(s, src, dst, src_size, dst_capacity, level, limit) };
+    written as c_int
+}
+
+/// `LZ4_compressHC_continue_generic` (lz4hc.c:1730).
+///
+/// Returns `(result, consumed)`; `consumed` only differs from `src_size` in
+/// `fillOutput` mode.
+fn hc_compress_continue_impl(
+    stream: *mut LZ4_streamHC_t,
+    src: *const c_char,
+    dst: *mut c_char,
+    src_size: c_int,
+    dst_capacity: c_int,
+    limit: crate::hc::Limit,
+) -> (c_int, c_int) {
+    if stream.is_null()
+        || src_size < 0
+        || dst_capacity < 0
+        || dst.is_null()
+        || (src_size != 0 && src.is_null())
+    {
+        return (0, 0);
+    }
+    let s = unsafe { &mut *stream.cast::<crate::hc::HcState>() };
+
+    // Auto-init if forgotten (lz4hc.c:1740).
+    if s.prefix_start == 0 {
+        s.init_internal(src as usize);
+    }
+
+    // Check overflow of the index space (lz4hc.c:1744).
+    if (s.end - s.prefix_start) + s.dict_limit as usize > 2 * 1024 * 1024 * 1024 {
+        let dict_size = (s.end - s.prefix_start).min(64 * 1024);
+        LZ4_loadDictHC(stream, (s.end - dict_size) as *const c_char, dict_size as c_int);
+    }
+    let s = unsafe { &mut *stream.cast::<crate::hc::HcState>() };
+
+    // Check if blocks follow each other (lz4hc.c:1751).
+    if src as usize != s.end {
+        s.set_external_dict(src as usize);
+    }
+
+    // Check overlapping input/dictionary space (lz4hc.c:1755).
+    {
+        let mut source_end = src as usize + src_size as usize;
+        let dict_begin = s.dict_start;
+        let dict_end = s.dict_start + (s.dict_limit - s.low_limit) as usize;
+        if source_end > dict_begin && (src as usize) < dict_end {
+            if source_end > dict_end {
+                source_end = dict_end;
+            }
+            s.low_limit += (source_end - s.dict_start) as u32;
+            s.dict_start += source_end - s.dict_start;
+            // Invalidate the dictionary if it has become too small.
+            if s.dict_limit - s.low_limit < 4 {
+                s.low_limit = s.dict_limit;
+                s.dict_start = s.prefix_start;
+            }
+        }
+    }
+
+    let level = s.compression_level as c_int;
+    let (written, consumed) =
+        unsafe { hc_compress_generic(s, src, dst, src_size, dst_capacity, level, limit) };
+    (written as c_int, consumed as c_int)
+}
+
 unsafe fn compress_ext_state_impl(
     state: *mut c_void,
     src: *const c_char,
@@ -307,7 +536,6 @@ unsafe fn decompress_safe_histories(
     {
         return -1;
     }
-    let input = unsafe { slice::from_raw_parts(src.cast::<u8>(), compressed_size as usize) };
     let external = if external_size == 0 {
         &[][..]
     } else if external_address == 0 {
@@ -315,30 +543,62 @@ unsafe fn decompress_safe_histories(
     } else {
         unsafe { slice::from_raw_parts(external_address as *const u8, external_size) }
     };
-    let prefix = if prefix_size == 0 {
-        &[][..]
-    } else if prefix_address == 0 {
+    if prefix_size != 0 && prefix_address == 0 {
         return -1;
-    } else {
-        unsafe { slice::from_raw_parts(prefix_address as *const u8, prefix_size) }
-    };
-    let mut buffer = vec![0u8; prefix.len() + output_size as usize];
-    buffer[..prefix.len()].copy_from_slice(&prefix);
-    let start = prefix.len();
-    let end = buffer.len();
-    let result = decode_result(block::decompress_dict(
-        &mut buffer,
-        start..end,
-        &Input::Separate(input),
-        partial,
-        output_size as usize,
-        external,
-        prefix.len(),
-    ));
-    if result >= 0 && result != 0 {
-        unsafe { core::ptr::copy(buffer[start..].as_ptr(), dst.cast::<u8>(), result as usize) };
     }
-    result
+    // A prefix is *contiguous with* `dst` by definition — C selects this mode
+    // precisely when `dictStart + dictSize == dst` — so the history and the
+    // output are one buffer, and we address it as one: `buf` spans
+    // `[dst - prefix_size, dst + output_size)`, with the block at `prefix_size`.
+    //
+    // It must NOT be staged through a scratch copy. Copying the prefix in
+    // *reads* all `prefix_size` bytes up front, where C only ever reads the
+    // bytes a match actually reaches back to. `fullbench` relies on the
+    // difference: `local_LZ4_decompress_safe_withPrefix64k` passes
+    // `out = orig_buff`, the head of a `malloc`, so the nominal 64 KB before it
+    // is unmapped. C never touches it (the data was compressed without a
+    // dictionary, so no offset reaches below `dst`); the eager copy segfaulted.
+    let dst_offset = prefix_size;
+    let span_lo = (dst as usize) - prefix_size;
+    let span_hi = (dst as usize) + output_size as usize;
+    let src_lo = src as usize;
+    let src_hi = src_lo + compressed_size as usize;
+    let overlaps = compressed_size != 0 && output_size != 0 && src_lo < span_hi && span_lo < src_hi;
+
+    let run = |buf: &mut [u8], input: &Input<'_>, shift: usize| {
+        decode_result(block::decompress_dict(
+            buf,
+            shift + dst_offset..shift + dst_offset + output_size as usize,
+            input,
+            partial,
+            output_size as usize,
+            external,
+            prefix_size,
+        ))
+    };
+
+    if overlaps {
+        // In-place decompression: `src` lies inside the same allocation as the
+        // output (`LZ4_DECOMPRESS_INPLACE_BUFFER_SIZE`). Holding `&[u8]` and
+        // `&mut [u8]` over the same bytes is UB, so span both and index in.
+        let lo = span_lo.min(src_lo);
+        let hi = span_hi.max(src_hi);
+        let buf = unsafe { slice::from_raw_parts_mut(lo as *mut u8, hi - lo) };
+        let s = (src_lo - lo)..(src_hi - lo);
+        run(buf, &Input::Within(s), span_lo - lo)
+    } else {
+        let input = if compressed_size == 0 {
+            &[][..]
+        } else {
+            unsafe { slice::from_raw_parts(src.cast::<u8>(), compressed_size as usize) }
+        };
+        let buf = if span_hi == span_lo {
+            &mut [][..]
+        } else {
+            unsafe { slice::from_raw_parts_mut(span_lo as *mut u8, span_hi - span_lo) }
+        };
+        run(buf, &Input::Separate(input), 0)
+    }
 }
 
 unsafe fn decompress_safe_impl(
@@ -1642,7 +1902,15 @@ pub extern "C" fn LZ4_attach_HC_dictionary(
     working_stream: *mut LZ4_streamHC_t,
     dictionary_stream: *const LZ4_streamHC_t,
 ) {
-    unimplemented!("LZ4_attach_HC_dictionary")
+    if working_stream.is_null() {
+        return;
+    }
+    let s = unsafe { &mut *working_stream.cast::<crate::hc::HcState>() };
+    s.dict_ctx = if dictionary_stream.is_null() {
+        0
+    } else {
+        dictionary_stream as usize
+    };
 }
 
 /// from lib/lz4.h
@@ -1699,7 +1967,8 @@ pub extern "C" fn LZ4_compressHC(
     dest: *mut c_char,
     inputSize: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_compressHC")
+    // deprecated: LZ4_compress_HC(src, dst, srcSize, LZ4_compressBound(srcSize), 0)
+    LZ4_compress_HC(source, dest, inputSize, LZ4_compressBound(inputSize), 0)
 }
 
 /// from lib/lz4hc.h
@@ -1710,7 +1979,7 @@ pub extern "C" fn LZ4_compressHC2(
     inputSize: c_int,
     compressionLevel: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_compressHC2")
+    LZ4_compress_HC(source, dest, inputSize, LZ4_compressBound(inputSize), compressionLevel)
 }
 
 /// from lib/lz4hc.h
@@ -1722,7 +1991,8 @@ pub extern "C" fn LZ4_compressHC2_continue(
     inputSize: c_int,
     compressionLevel: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_compressHC2_continue")
+    // lz4hc.c:2238 — calls LZ4HC_compress_generic with notLimited
+    hc_compress_generic_raw(LZ4HC_Data, source, dest, inputSize, 0, compressionLevel, crate::hc::Limit::NotLimited)
 }
 
 /// from lib/lz4hc.h
@@ -1734,7 +2004,7 @@ pub extern "C" fn LZ4_compressHC2_limitedOutput(
     maxOutputSize: c_int,
     compressionLevel: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_compressHC2_limitedOutput")
+    LZ4_compress_HC(source, dest, inputSize, maxOutputSize, compressionLevel)
 }
 
 /// from lib/lz4hc.h
@@ -1747,7 +2017,8 @@ pub extern "C" fn LZ4_compressHC2_limitedOutput_continue(
     maxOutputSize: c_int,
     compressionLevel: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_compressHC2_limitedOutput_continue")
+    // lz4hc.c:2243
+    hc_compress_generic_raw(LZ4HC_Data, source, dest, inputSize, maxOutputSize, compressionLevel, crate::hc::Limit::LimitedOutput)
 }
 
 /// from lib/lz4hc.h
@@ -1760,7 +2031,7 @@ pub extern "C" fn LZ4_compressHC2_limitedOutput_withStateHC(
     maxOutputSize: c_int,
     compressionLevel: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_compressHC2_limitedOutput_withStateHC")
+    LZ4_compress_HC_extStateHC(state, source, dest, inputSize, maxOutputSize, compressionLevel)
 }
 
 /// from lib/lz4hc.h
@@ -1772,7 +2043,7 @@ pub extern "C" fn LZ4_compressHC2_withStateHC(
     inputSize: c_int,
     compressionLevel: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_compressHC2_withStateHC")
+    LZ4_compress_HC_extStateHC(state, source, dest, inputSize, LZ4_compressBound(inputSize), compressionLevel)
 }
 
 /// from lib/lz4hc.h
@@ -1783,7 +2054,7 @@ pub extern "C" fn LZ4_compressHC_continue(
     dest: *mut c_char,
     inputSize: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_compressHC_continue")
+    LZ4_compress_HC_continue(LZ4_streamHCPtr, source, dest, inputSize, LZ4_compressBound(inputSize))
 }
 
 /// from lib/lz4hc.h
@@ -1794,7 +2065,7 @@ pub extern "C" fn LZ4_compressHC_limitedOutput(
     inputSize: c_int,
     maxOutputSize: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_compressHC_limitedOutput")
+    LZ4_compress_HC(source, dest, inputSize, maxOutputSize, 0)
 }
 
 /// from lib/lz4hc.h
@@ -1806,7 +2077,7 @@ pub extern "C" fn LZ4_compressHC_limitedOutput_continue(
     inputSize: c_int,
     maxOutputSize: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_compressHC_limitedOutput_continue")
+    LZ4_compress_HC_continue(LZ4_streamHCPtr, source, dest, inputSize, maxOutputSize)
 }
 
 /// from lib/lz4hc.h
@@ -1818,7 +2089,7 @@ pub extern "C" fn LZ4_compressHC_limitedOutput_withStateHC(
     inputSize: c_int,
     maxOutputSize: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_compressHC_limitedOutput_withStateHC")
+    LZ4_compress_HC_extStateHC(state, source, dest, inputSize, maxOutputSize, 0)
 }
 
 /// from lib/lz4hc.h
@@ -1829,7 +2100,7 @@ pub extern "C" fn LZ4_compressHC_withStateHC(
     dest: *mut c_char,
     inputSize: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_compressHC_withStateHC")
+    LZ4_compress_HC_extStateHC(state, source, dest, inputSize, LZ4_compressBound(inputSize), 0)
 }
 
 /// from lib/lz4hc.h
@@ -1841,7 +2112,15 @@ pub extern "C" fn LZ4_compress_HC(
     dstCapacity: c_int,
     compressionLevel: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_compress_HC")
+    // lz4hc.c:1568 — allocate a context on the heap (C's LZ4HC_HEAPMODE=1
+    // default; the state is ~256 KB, too large for a stack frame) and delegate.
+    let state = LZ4_createStreamHC();
+    if state.is_null() {
+        return 0;
+    }
+    let cs = LZ4_compress_HC_extStateHC(state.cast(), src, dst, srcSize, dstCapacity, compressionLevel);
+    LZ4_freeStreamHC(state);
+    cs
 }
 
 /// from lib/lz4hc.h
@@ -1853,7 +2132,13 @@ pub extern "C" fn LZ4_compress_HC_continue(
     srcSize: c_int,
     maxDstSize: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_compress_HC_continue")
+    // lz4hc.c:1775
+    let limit = if maxDstSize < LZ4_compressBound(srcSize) {
+        crate::hc::Limit::LimitedOutput
+    } else {
+        crate::hc::Limit::NotLimited
+    };
+    hc_compress_continue_impl(streamHCPtr, src, dst, srcSize, maxDstSize, limit).0
 }
 
 /// from lib/lz4hc.h
@@ -1865,7 +2150,23 @@ pub extern "C" fn LZ4_compress_HC_continue_destSize(
     srcSizePtr: *mut c_int,
     targetDstSize: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_compress_HC_continue_destSize")
+    // lz4hc.c:1784
+    if srcSizePtr.is_null() {
+        return 0;
+    }
+    let src_size = unsafe { *srcSizePtr };
+    let (written, consumed) = hc_compress_continue_impl(
+        LZ4_streamHCPtr,
+        src,
+        dst,
+        src_size,
+        targetDstSize,
+        crate::hc::Limit::FillOutput,
+    );
+    if written > 0 {
+        unsafe { *srcSizePtr = consumed };
+    }
+    written
 }
 
 /// from lib/lz4hc.h
@@ -1878,7 +2179,35 @@ pub extern "C" fn LZ4_compress_HC_destSize(
     targetDstSize: c_int,
     compressionLevel: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_compress_HC_destSize")
+    // lz4hc.c:1587 — always fillOutput.
+    if srcSizePtr.is_null() || dst.is_null() || targetDstSize < 0 {
+        return 0;
+    }
+    let src_size = unsafe { *srcSizePtr };
+    if src_size < 0 || (src_size != 0 && src.is_null()) {
+        return 0;
+    }
+    if LZ4_initStreamHC(stateHC, crate::types::LZ4_STREAMHC_SIZE).is_null() {
+        return 0; // init failure
+    }
+    let s = unsafe { &mut *stateHC.cast::<crate::hc::HcState>() };
+    s.init_internal(src as usize);
+    s.set_level(compressionLevel);
+    let (written, consumed) = unsafe {
+        hc_compress_generic(
+            s,
+            src,
+            dst,
+            src_size,
+            targetDstSize,
+            compressionLevel,
+            crate::hc::Limit::FillOutput,
+        )
+    };
+    if written > 0 {
+        unsafe { *srcSizePtr = consumed as c_int };
+    }
+    written as c_int
 }
 
 /// from lib/lz4hc.h
@@ -1891,7 +2220,11 @@ pub extern "C" fn LZ4_compress_HC_extStateHC(
     maxDstSize: c_int,
     compressionLevel: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_compress_HC_extStateHC")
+    // lz4hc.c:1561 — init, then the fast-reset path.
+    if LZ4_initStreamHC(stateHC, crate::types::LZ4_STREAMHC_SIZE).is_null() {
+        return 0; // init failure
+    }
+    LZ4_compress_HC_extStateHC_fastReset(stateHC, src, dst, srcSize, maxDstSize, compressionLevel)
 }
 
 /// from lib/lz4hc.h
@@ -1904,7 +2237,28 @@ pub extern "C" fn LZ4_compress_HC_extStateHC_fastReset(
     dstCapacity: c_int,
     compressionLevel: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_compress_HC_extStateHC_fastReset")
+    // lz4hc.c:1554 — the state is presumed already initialised and aligned.
+    if state.is_null()
+        || state as usize % crate::types::LZ4_STREAMHC_ALIGN != 0
+        || dstCapacity < 0
+        || srcSize < 0
+        || (srcSize != 0 && src.is_null())
+        || dst.is_null()
+    {
+        return 0;
+    }
+    let s = unsafe { &mut *state.cast::<crate::hc::HcState>() };
+    s.reset_stream_fast(compressionLevel);
+    s.init_internal(src as usize);
+    let limit = if dstCapacity < LZ4_compressBound(srcSize) {
+        crate::hc::Limit::LimitedOutput
+    } else {
+        crate::hc::Limit::NotLimited
+    };
+    let (written, _) = unsafe {
+        hc_compress_generic(s, src, dst, srcSize, dstCapacity, compressionLevel, limit)
+    };
+    written as c_int
 }
 
 /// from lib/lz4.h
@@ -2183,7 +2537,12 @@ pub extern "C" fn LZ4_create(inputBuffer: *mut c_char) -> *mut c_void {
 /// from lib/lz4hc.h
 #[no_mangle]
 pub extern "C" fn LZ4_createHC(inputBuffer: *const c_char) -> *mut c_void {
-    unimplemented!("LZ4_createHC")
+    // lz4hc.c:2222 — createStreamHC + init_internal
+    let stream = LZ4_createStreamHC();
+    if stream.is_null() { return core::ptr::null_mut(); }
+    let s = unsafe { &mut *stream.cast::<crate::hc::HcState>() };
+    s.init_internal(inputBuffer as usize);
+    stream.cast()
 }
 
 /// from lib/lz4.h
@@ -2201,7 +2560,21 @@ pub extern "C" fn LZ4_createStreamDecode() -> *mut LZ4_streamDecode_t {
 /// from lib/lz4hc.h
 #[no_mangle]
 pub extern "C" fn LZ4_createStreamHC() -> *mut LZ4_streamHC_t {
-    unimplemented!("LZ4_createStreamHC")
+    // lz4hc.c:1603 — alloc_zeroed + set default level
+    let ptr = unsafe {
+        std::alloc::alloc_zeroed(
+            std::alloc::Layout::from_size_align(
+                crate::types::LZ4_STREAMHC_SIZE,
+                crate::types::LZ4_STREAMHC_ALIGN,
+            ).unwrap()
+        )
+    };
+    if ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    let s = unsafe { &mut *ptr.cast::<crate::hc::HcState>() };
+    s.set_level(crate::hc::LZ4HC_CLEVEL_DEFAULT);
+    ptr.cast()
 }
 
 /// from lib/lz4.h
@@ -2495,13 +2868,15 @@ pub unsafe extern "C" fn LZ4_decompress_safe_withPrefix64k(
 /// from lib/lz4hc.h
 #[no_mangle]
 pub extern "C" fn LZ4_favorDecompressionSpeed(LZ4_streamHCPtr: *mut LZ4_streamHC_t, favor: c_int) {
-    unimplemented!("LZ4_favorDecompressionSpeed")
+    if LZ4_streamHCPtr.is_null() { return; }
+    let s = unsafe { &mut *LZ4_streamHCPtr.cast::<crate::hc::HcState>() };
+    s.set_favor_dec_speed(favor != 0);
 }
 
 /// from lib/lz4hc.h
 #[no_mangle]
 pub extern "C" fn LZ4_freeHC(LZ4HC_Data: *mut c_void) -> c_int {
-    unimplemented!("LZ4_freeHC")
+    LZ4_freeStreamHC(LZ4HC_Data.cast())
 }
 
 /// from lib/lz4.h
@@ -2535,7 +2910,18 @@ pub unsafe extern "C" fn LZ4_freeStreamDecode(LZ4_stream: *mut LZ4_streamDecode_
 /// from lib/lz4hc.h
 #[no_mangle]
 pub extern "C" fn LZ4_freeStreamHC(streamHCPtr: *mut LZ4_streamHC_t) -> c_int {
-    unimplemented!("LZ4_freeStreamHC")
+    if !streamHCPtr.is_null() {
+        unsafe {
+            std::alloc::dealloc(
+                streamHCPtr.cast(),
+                std::alloc::Layout::from_size_align(
+                    crate::types::LZ4_STREAMHC_SIZE,
+                    crate::types::LZ4_STREAMHC_ALIGN,
+                ).unwrap(),
+            )
+        };
+    }
+    0
 }
 
 /// from lib/lz4.h
@@ -2557,7 +2943,15 @@ pub unsafe extern "C" fn LZ4_initStream(
 /// from lib/lz4hc.h
 #[no_mangle]
 pub extern "C" fn LZ4_initStreamHC(buffer: *mut c_void, size: usize) -> *mut LZ4_streamHC_t {
-    unimplemented!("LZ4_initStreamHC")
+    if buffer.is_null()
+        || size < crate::types::LZ4_STREAMHC_SIZE
+        || buffer as usize % crate::types::LZ4_STREAMHC_ALIGN != 0
+    {
+        return core::ptr::null_mut();
+    }
+    let s = unsafe { &mut *buffer.cast::<crate::hc::HcState>() };
+    s.init_stream();
+    buffer.cast()
 }
 
 /// from lib/lz4.h
@@ -2577,7 +2971,41 @@ pub extern "C" fn LZ4_loadDictHC(
     dictionary: *const c_char,
     dictSize: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_loadDictHC")
+    // lz4hc.c:1675
+    if streamHCPtr.is_null() || dictSize < 0 || (dictSize != 0 && dictionary.is_null()) {
+        return 0;
+    }
+    let dict_size = dictSize as usize;
+    // Keep only the last 64 KB — beyond that, offsets are unrepresentable.
+    let (dict_ptr, dict_size) = if dict_size > 64 * 1024 {
+        (unsafe { dictionary.add(dict_size - 64 * 1024) }, 64 * 1024)
+    } else {
+        (dictionary, dict_size)
+    };
+
+    let s = unsafe { &mut *streamHCPtr.cast::<crate::hc::HcState>() };
+    // A full initialization: resetFast() has bad side-effects here.
+    let level = s.compression_level as c_int;
+    s.init_stream();
+    s.set_level(level);
+
+    s.init_internal(dict_ptr as usize);
+    s.end = dict_ptr as usize + dict_size;
+
+    // C branches on the strategy here; only lz4mid is ported, so the hash-chain
+    // `LZ4HC_Insert` arm is absent — see the scope note in `crate::hc`.
+    let dict: &[u8] = if dict_size > 0 {
+        unsafe { core::slice::from_raw_parts(dict_ptr as *const u8, dict_size) }
+    } else {
+        &[]
+    };
+    let prefix_idx = s.dict_limit;
+    let mut next_to_update = s.next_to_update;
+    let (hash4, hash8) = s.hash_table.split_at_mut(crate::hc::LZ4MID_HASHTABLESIZE);
+    crate::hc::mid_fill_htable(hash4, hash8, dict, prefix_idx, &mut next_to_update);
+    s.next_to_update = next_to_update;
+
+    dict_size as c_int
 }
 
 /// from lib/lz4.h
@@ -2601,7 +3029,9 @@ pub unsafe extern "C" fn LZ4_resetStream(streamPtr: *mut LZ4_stream_t) {
 /// from lib/lz4hc.h
 #[no_mangle]
 pub extern "C" fn LZ4_resetStreamHC(streamHCPtr: *mut LZ4_streamHC_t, compressionLevel: c_int) {
-    unimplemented!("LZ4_resetStreamHC")
+    if streamHCPtr.is_null() { return; }
+    let s = unsafe { &mut *streamHCPtr.cast::<crate::hc::HcState>() };
+    s.reset_stream(compressionLevel);
 }
 
 /// from lib/lz4hc.h
@@ -2610,7 +3040,9 @@ pub extern "C" fn LZ4_resetStreamHC_fast(
     streamHCPtr: *mut LZ4_streamHC_t,
     compressionLevel: c_int,
 ) {
-    unimplemented!("LZ4_resetStreamHC_fast")
+    if streamHCPtr.is_null() { return; }
+    let s = unsafe { &mut *streamHCPtr.cast::<crate::hc::HcState>() };
+    s.reset_stream_fast(compressionLevel);
 }
 
 /// from lib/lz4.h
@@ -2627,7 +3059,14 @@ pub extern "C" fn LZ4_resetStreamState(state: *mut c_void, inputBuffer: *mut c_c
 /// from lib/lz4hc.h
 #[no_mangle]
 pub extern "C" fn LZ4_resetStreamStateHC(state: *mut c_void, inputBuffer: *mut c_char) -> c_int {
-    unimplemented!("LZ4_resetStreamStateHC")
+    // lz4hc.c:2213: init then init_internal with inputBuffer
+    let ptr = LZ4_initStreamHC(state, crate::types::LZ4_STREAMHC_SIZE);
+    if ptr.is_null() {
+        return 1;
+    }
+    let s = unsafe { &mut *ptr.cast::<crate::hc::HcState>() };
+    s.init_internal(inputBuffer as usize);
+    0
 }
 
 /// from lib/lz4.h
@@ -2674,7 +3113,45 @@ pub extern "C" fn LZ4_saveDictHC(
     safeBuffer: *mut c_char,
     maxDictSize: c_int,
 ) -> c_int {
-    unimplemented!("LZ4_saveDictHC")
+    // lz4hc.c:1791
+    if streamHCPtr.is_null() {
+        return 0;
+    }
+    let s = unsafe { &mut *streamHCPtr.cast::<crate::hc::HcState>() };
+    let prefix_size = s.end.wrapping_sub(s.prefix_start);
+    // Clamps in C's order. A negative maxDictSize falls out as 0 via `< 4`.
+    let mut dict_size = maxDictSize.min(64 * 1024);
+    if dict_size < 4 {
+        dict_size = 0;
+    }
+    if dict_size as usize > prefix_size {
+        dict_size = prefix_size as c_int;
+    }
+    let dict_size = dict_size as usize;
+    // C asserts dictSize == 0 for a NULL buffer, then still re-bases the state.
+    if dict_size > 0 && !safeBuffer.is_null() {
+        unsafe {
+            core::ptr::copy(
+                (s.end - dict_size) as *const u8,
+                safeBuffer as *mut u8,
+                dict_size,
+            )
+        };
+    }
+    let end_index = prefix_size as u32 + s.dict_limit;
+    s.end = if safeBuffer.is_null() {
+        0
+    } else {
+        safeBuffer as usize + dict_size
+    };
+    s.prefix_start = safeBuffer as usize;
+    s.dict_limit = end_index - dict_size as u32;
+    s.low_limit = end_index - dict_size as u32;
+    s.dict_start = s.prefix_start;
+    if s.next_to_update < s.dict_limit {
+        s.next_to_update = s.dict_limit;
+    }
+    dict_size as c_int
 }
 
 /// from lib/lz4hc.h
@@ -2683,7 +3160,9 @@ pub extern "C" fn LZ4_setCompressionLevel(
     LZ4_streamHCPtr: *mut LZ4_streamHC_t,
     compressionLevel: c_int,
 ) {
-    unimplemented!("LZ4_setCompressionLevel")
+    if LZ4_streamHCPtr.is_null() { return; }
+    let s = unsafe { &mut *LZ4_streamHCPtr.cast::<crate::hc::HcState>() };
+    s.set_level(compressionLevel);
 }
 
 /// from lib/lz4.h
@@ -2717,7 +3196,7 @@ pub extern "C" fn LZ4_sizeofState() -> c_int {
 /// from lib/lz4hc.h
 #[no_mangle]
 pub extern "C" fn LZ4_sizeofStateHC() -> c_int {
-    unimplemented!("LZ4_sizeofStateHC")
+    crate::types::LZ4_STREAMHC_SIZE as c_int
 }
 
 /// from lib/lz4.h
@@ -2729,7 +3208,7 @@ pub extern "C" fn LZ4_sizeofStreamState() -> c_int {
 /// from lib/lz4hc.h
 #[no_mangle]
 pub extern "C" fn LZ4_sizeofStreamStateHC() -> c_int {
-    unimplemented!("LZ4_sizeofStreamStateHC")
+    LZ4_sizeofStateHC()
 }
 
 /// from lib/lz4.h
@@ -2745,7 +3224,15 @@ pub extern "C" fn LZ4_slideInputBuffer(state: *mut c_void) -> *mut c_char {
 /// from lib/lz4hc.h
 #[no_mangle]
 pub extern "C" fn LZ4_slideInputBufferHC(LZ4HC_Data: *mut c_void) -> *mut c_char {
-    unimplemented!("LZ4_slideInputBufferHC")
+    // lz4hc.c:2248 — returns bufferStart, then resets
+    if LZ4HC_Data.is_null() { return core::ptr::null_mut(); }
+    let s = unsafe { &mut *LZ4HC_Data.cast::<crate::hc::HcState>() };
+    let buffer_start = s.prefix_start.wrapping_sub(
+        s.dict_limit.wrapping_sub(s.low_limit) as usize
+    );
+    let level = s.compression_level as i32;
+    s.reset_stream_fast(level);
+    buffer_start as *mut c_char
 }
 
 /// from lib/lz4.h
