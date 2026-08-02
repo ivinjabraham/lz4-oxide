@@ -742,6 +742,18 @@ fn nb_common_bytes(diff: u64) -> usize {
 #[inline]
 fn common_bytes(a: &[u8], i: usize, b: &[u8], j: usize, n: usize) -> usize {
     const STEP: usize = 8;
+    // The clamps below are a guard, not an expected outcome: reaching them
+    // means a caller broke C's precondition, and the honest signal for that is
+    // a crash, not a short count. The byte-at-a-time loop this replaced gave
+    // one for free -- it indexed out of bounds and panicked. Clamping instead
+    // turns the same bug into wrong output, which is strictly harder to find,
+    // so assert in debug and keep the guard in release.
+    //
+    // Not hypothetical: the stale-`active_hist` bug fixed in the lz4hc work
+    // drove `j` to ~4.29e9 here. Against the old byte loop that panicked with
+    // "index out of bounds"; against this function it surfaced only as
+    // `fuzzer -i60 -s9` reporting a different-sized output at cycle 54.
+    debug_assert!(i <= a.len() && j <= b.len(), "match index out of range");
     let n = n
         .min(a.len().saturating_sub(i))
         .min(b.len().saturating_sub(j));
