@@ -847,6 +847,42 @@ Neither `perf` nor `valgrind` is installed on the dev host, so each hypothesis
 was tested by changing one thing and re-measuring. That is why the table above
 lists what was ruled *out*: with no profile, a negative result is the evidence.
 
+### `LZ4_FAST_DEC_LOOP`: ported, measured, reverted
+
+The module header calls this the second of two deliberate departures, and §9
+called it the largest remaining decode lever. It was implemented on
+`perf/fast-dec-loop`, verified byte-identical, measured, and **reverted for
+being slower on every input**:
+
+| `LZ4_decompress_safe`, same session, best-of-3 | general loop | with fast loop |
+|---|---|---|
+| `datagen -P20` | 9659 | 9485 |
+| `datagen -P50` | 5166 | 4880 |
+| `datagen -P90` | 3146 | **2452** (−22%) |
+
+**Why, and it is not an implementation detail that could be tuned away.** C's
+fast loop is fast because of its *control flow*: with 64 bytes of slack
+guaranteed it deletes per-sequence bound tests, and where a sequence does not
+fit that budget it `goto`s into the middle of the safe loop —
+`safe_literal_copy_early`, `safe_literal_copy`, `safe_match_copy` — sometimes
+with the literals already written. There is no Rust for a jump into another
+loop's body, so this port made every decision *before* writing anything, reading
+the offset and match length from their known positions past the literal run and
+rewinding `ip` to the sequence start on any bail.
+
+That is byte-exact (1891/1891, and all four known fuzzer seeds) but it *adds*
+work per sequence rather than removing it — precisely inverting the point. And
+the sequences it intercepts are already served by the two-stage shortcut in the
+general loop (lz4.c:2241-2272), which is C's fast path for short sequences and
+which this port has had from the start. On `-P90`, which is almost entirely
+short sequences, the fast loop replaced a cheaper path with a dearer one.
+
+The reusable lesson: **`LZ4_FORCE_INLINE` and `goto` are load-bearing in C's
+hot loops, and neither survives translation.** Where an optimisation's benefit
+comes from control flow rather than from the operations performed, porting it
+faithfully in output does not port its performance. Compare §8.4's compression
+ablations, which say the same thing from the other direction.
+
 ### One regression in fail-loudness, recorded deliberately
 
 `common_bytes` clamps its length against both slices, so a caller that violates
@@ -904,14 +940,12 @@ where C merely reads a word past the match end, which is why it is still there.
       rather than a fixed sweep
 - [ ] Benchmark report: p99, RSS, startup, with methodology — throughput vs C
       is done and reproducible (§8.4, `bench/`); p99, RSS and startup are not
-- [ ] **Port `LZ4_FAST_DEC_LOOP`** (§8.4). The second of `block.rs`'s two stated
-      departures, still untested, and the largest remaining decode lever on
-      many-short-sequence data. Deliberately *not* attempted before the
-      deadline: it introduces new margin comparisons (`ip < iend-15`,
-      `op < oend-64`) in exactly the class that produced two crashes and a
-      flaky suite, and `bench/verify.sh`'s capacity sweep covers the 32-byte
-      shortcut margin but not a 64-byte one. Whoever picks it up should extend
-      that sweep **first**, then write the margins additively from the outset.
+- [x] **`LZ4_FAST_DEC_LOOP` was ported, measured, and reverted** (§8.4). It was
+      *slower* than the general loop on every input — the second of `block.rs`'s
+      two stated departures turns out not to be a lever at all, in the form Rust
+      can express. Kept as a closed question with the numbers, because "port the
+      fast loop" is the obvious next idea and it costs an afternoon to
+      re-discover.
 - [x] **Monomorphising the hot loops was measured and is not the win it looks
       like** (§8.4). The `LZ4_FORCE_INLINE` count says specialise; ablation says
       ~5% per site, against 0% for per-call allocation and 0% for table bounds
