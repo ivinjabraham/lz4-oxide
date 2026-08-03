@@ -23,7 +23,7 @@ path = "tests/port/safe_helpers.rs"
 # None. xxHash is implemented in-tree (src/xxh.rs) rather than taken from a
 # crate: XXH32_state_t/XXH64_state_t are declared on the C test's stack, so
 # their layout is fixed by the C header and no crate's private state type can
-# match it. See DECISIONS.md §6.
+# match it. See DECISIONS.md section 4.
 
 [build-dependencies]
 cc = "1.0"

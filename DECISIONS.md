@@ -46,6 +46,16 @@ provide liblz4's complete C ABI, caller-allocated state layouts, frame surface,
 or all HC strategies. This project ports the pinned repository's API and
 behavior and does not depend on `lz4_flex`.
 
+### This is not source-language runtime linking
+
+The eligibility rules separately bar leaning on the *source language's*
+runtime (e.g. a Rust program shelling out to a Python interpreter). C has no
+such runtime, and none is linked. The only C left in the built test binaries
+is the harness itself, which the rules require to stay unmodified, plus the
+CLI, kept by choice. Every `LZ4_*`/`LZ4F_*` symbol the test binaries reference
+resolves into Rust; `make provenance-check` verifies no `lib/*.c` object
+participates in the link.
+
 ## 2. ABI and Build Architecture
 
 ### Export the original library ABI
@@ -104,6 +114,12 @@ The current build does not propagate arbitrary test-side `LZ4_MEMORY_USAGE`
 overrides into Cargo. A C caller and Rust library built with different values
 would disagree about state size. Supported builds must therefore use the same
 headers and configuration for both sides.
+
+`LZ4F_CustomMem` is probed for a different reason: it crosses the boundary **by
+value**, not by pointer, into `LZ4F_createCDict_advanced` and
+`LZ4F_createCompressionContext_advanced`. A wrong layout on a by-value struct
+does not fail to link — it silently corrupts, with no pointer mismatch to
+catch it.
 
 ### Keep opaque handles owned by Rust
 
@@ -235,6 +251,12 @@ Wild copies are used only where upstream's margins prove that fixed-width
 overreads and overwrites remain within allocated slices. Near a boundary, the
 decoder uses exact copies.
 
+Below that, a length cutoff (~32 bytes) switches between fixed-width copies and
+`memcpy`/`memmove` — a threshold C has no equivalent of, since its wildcopy has
+no per-step call to amortize. Calling `memcpy` for the few bytes a typical
+sequence moves costs more than the copy; without the cutoff, literal-heavy
+input loses roughly a third of its decode throughput.
+
 ### Pointer-style bounds comparisons are expressed additively
 
 Upstream often compares against pointers such as `oend - 32`. On a buffer
@@ -263,6 +285,12 @@ output and avoids copies where possible. The Rust implementation keeps an owned
 decoded bytes because only history content affects decoding, but it costs a
 copy as history advances.
 
+This reasoning does **not** extend to compression. There, `withPrefix64k` vs.
+`usingExtDict` changes which matches the search finds, so the two paths stay
+distinct. Collapsing them the same way once cost 6 bytes per multi-block
+frame — a difference invisible to round trips and caught only by
+byte-comparison against C.
+
 ## 8. Known Divergences and Unverified Areas
 
 | Area | Current behavior | Consequence |
@@ -271,7 +299,7 @@ copy as history advances.
 | Malformed frame input | Differential rejection testing covers block decoding, not frame decoding. | Exact frame error parity is unverified. |
 | Frame custom allocators | Hooks own contexts but not internal `Vec` buffers. | Allocator ownership and `LZ4F_cctx_size` semantics differ from C. |
 | Debug HC calls | A null `prefixStart` can reach `slice::from_raw_parts` in `src/ffi.rs`. | Debug builds abort before the fuzzer can exercise assertions; release behavior is unaffected. |
-| Decoder fast loop | The safe decoder ports the two-stage shortcut but not upstream's full `LZ4_FAST_DEC_LOOP`. | Correctness is covered for the current loop; many-short-sequence throughput remains lower. |
+| Decoder fast loop | Implemented, verified byte-identical, measured, then **reverted**: slower than the general loop on every input tried (worst case -22%). Its speed in C comes from `goto`-ing into the middle of another loop, which Rust cannot express without doing the bail-out work up front on every sequence — so the port paid the cost C's control flow avoids. | The two-stage shortcut (ported) remains the fast path; many-short-sequence throughput is lower than C. |
 | Release fail-loudness | `common_bytes` clamps invalid indices after a debug assertion. | A broken internal precondition can become wrong output rather than a release panic. |
 | Build-time memory configuration | Cargo and C must use the same probed `LZ4_MEMORY_USAGE`. | Independently overriding only the C side can corrupt caller-allocated state. |
 
