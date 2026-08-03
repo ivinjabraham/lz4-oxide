@@ -1,0 +1,31 @@
+# Rust and generated ABI outputs
+/target/
+/abi.orig.sorted.txt
+/abi.rust.sorted.txt
+/abi.rust.txt
+
+# Upstream is fetched at the exact kickoff commit in its own build stage.
+/upstream/
+
+# Benchmark run outputs
+/bench/results/
+**/*.raw
+**/*.log
+**/benchmark-results/
+**/bench-results/
+
+# Editors, local environments, and common secrets
+**/.DS_Store
+**/.idea/
+**/.vscode/
+**/*~
+**/*.swp
+**/*.swo
+**/.env
+**/.env.*
+**/*.key
+**/*.pem
+**/credentials.json
+
+# Host Git metadata can contain credentials, hooks, and reflogs.
+/.git/
