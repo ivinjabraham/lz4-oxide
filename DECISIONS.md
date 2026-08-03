@@ -138,13 +138,25 @@ means our port must have no hidden `static mut`, no lazily-initialised global
 table, no interior mutability behind a shared reference — which Rust enforces
 for us far more strictly than C did.
 
-This is not a gap dodged, but be precise about its status: it is a claim we
-have **set up to be checked, not yet checked**. The C CLI's threadpool drives
-the library multi-threaded, so once functions exist, `make test` exercises our
-Rust concurrently and any hidden global mutable state would corrupt output or
-trip a race. The `Using 6 threads for compression` line quoted from the baseline
-run came from the **C** library, not from this port — no function is implemented
-yet. Re-state this section with real evidence once the suite runs green.
+**This is now checked, not merely claimed** (2026-08-03). The C CLI's threadpool
+drives the library multi-threaded, so `make test` exercises our Rust
+concurrently, and any hidden global mutable state would corrupt output or trip a
+race. In the green end-to-end run, four `Using 6 threads for compression` lines
+appear in the log — and `make provenance-check` reports `rust  lz4`, so the CLI
+emitting them is the one linked against this port, not the C library. Thirteen
+`test-lz4-*.sh` cases ran through it and the suite exited 0.
+
+An earlier revision of this paragraph was careful to say the opposite, because
+the `Using 6 threads` line it quoted came from the **C** baseline run at a point
+when no function was implemented. Worth preserving as a caution: that line looks
+identical either way, and the only thing distinguishing them is which library
+the CLI was linked against.
+
+What this does *not* prove is absence of a data race — the suite is not run
+under a race detector, and LZ4's threads partition work by block rather than
+sharing state, so a latent race might simply not be exercised. What it does
+establish is the concrete claim §1.1 makes: no hidden global mutable state, on
+the paths the suite covers.
 
 That coverage is **not automatic** — it has to be wired deliberately, and
 getting it wrong yields shell tests that pass while testing the C library. See
