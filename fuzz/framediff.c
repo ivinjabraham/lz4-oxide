@@ -24,7 +24,7 @@
  * perfectly. Mode 0 vs mode 1 is the pair that matters most -- linked vs
  * independent blocks -- because linked blocks are where the compressor's
  * history handling can diverge while still producing decodable output. That is
- * exactly the bug this harness caught (DECISIONS.md §8.1).
+ * exactly the bug documented at Cctx::make_block in src/frame.rs.
  */
 #include <stdio.h>
 #include <stdlib.h>

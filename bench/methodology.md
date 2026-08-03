@@ -2,8 +2,9 @@
 
 This directory contains one reproducible runner and its machine-readable output
 for comparisons against the pinned C library. Differential byte-identity and
-rejection-parity coverage uses the same runner through `make difftest`; analysis
-and limitations live in [DECISIONS.md §8.4](../DECISIONS.md).
+rejection-parity coverage uses the same runner through `make difftest`;
+verification scope and limitations live in
+[DECISIONS.md sections 6 and 8](../DECISIONS.md).
 
 ## Run Everything
 

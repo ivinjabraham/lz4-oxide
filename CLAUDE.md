@@ -21,7 +21,7 @@ make test         # the score — the full unmodified upstream suite
 `make difftest` is the one that matters while editing. The upstream suite is
 round-trips and CRCs, so it cannot see compressed output that is wrong but
 *valid*, nor an error returned at the wrong offset — and both have happened
-here (DECISIONS.md §8.2, §8.4). Run it before you trust a green suite.
+here (DECISIONS.md sections 6 and 7). Run it before you trust a green suite.
 
 **Do not record which functions are done** — not here, not in PLAN.md. That is
 a doc edit per commit and it goes stale between them. The commands above are
@@ -49,9 +49,9 @@ the status.
 - Rust may be installed but absent from an existing shell's PATH:
   `source "$HOME/.cargo/env"`.
 - Two separate build traps can produce a green test suite that is exercising
-  **C, not Rust** (see PLAN.md §8). The `C_SRCDIRS` / `LDLIBS` / `-o lz4`
-  machinery in `Makefile` handles both — don't simplify it. To confirm the port
-  is really under test: `./upstream/tests/fuzzer -i1` must panic in `src/ffi.rs`.
+  **C, not Rust** (see DECISIONS.md section 2). The `C_SRCDIRS` / `LDLIBS` /
+  `-o lz4` machinery in `Makefile` handles both; do not simplify it. Use
+  `make provenance-check` to confirm each binary's `lz4.o` uses `cstub/`.
 
 ## Commands
 

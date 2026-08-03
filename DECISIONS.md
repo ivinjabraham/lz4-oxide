@@ -1,923 +1,306 @@
-# DECISIONS.md — LZ4 (C) → Rust
+# Decision Log: LZ4 C to Rust
 
-Port Mortem Hackathon 2026, Track A (C → Rust).
+This file records the decisions that define the port: its scope, ABI strategy,
+safety boundary, compatibility requirements, and known divergences. Current
+work belongs in [PLAN.md](PLAN.md), porting traps belong in
+[PORTING.md](PORTING.md), and generated performance numbers belong in
+[`bench/results.json`](bench/results.json).
 
-Everything below records *why* the port is shaped the way it is. Where a claim
-is checkable, the command that checks it is included.
-
-Two parts, because they answer different questions. **Part I** is about the
-entry: what we chose to port, why the repository qualifies, and how lz4's own
-test suite runs against Rust without a single edit. **Part II** is about the
-code: the artefact's shape, the layouts it must match, and the policies that
-govern what goes inside it. §0 is the evidence table for both.
-
----
-
-## 0. Verification status
-
-Last verified 2026-08-03 on x86_64-unknown-linux-gnu,
-rustc 1.97.1 (8bab26f4f), gcc 16.1.1, against upstream lz4 pinned at `0774d055`.
-
-| Claim | Command | Result |
-|---|---|---|
-| **lz4's own suite passes against the port** | `make test` | **exit 0, end to end** |
-| No `unimplemented!()` remains | `grep unimplemented\! src/` | **0** |
-| Rust archive exports exactly the original ABI | `make abi-check` | **141/141, zero diff** |
-| Original C tests link against the port | `make link-check` | **pass** |
-| No test binary contains a C implementation object | `make provenance-check` | **6/6 from `cstub/`** |
-| Block + frame codecs byte-identical to C, and reject identically | `fuzz/driver.sh` | **1261/1261** |
-| HC levels 1-12 byte-identical to C | `fuzz/driver.sh` | **108/108 identical** (§8.2) |
-| Upstream tree unmodified | `git -C upstream status --short` | **empty** |
-| Original test files match their kickoff hashes | `make kickoff-verify` | **42/42** |
-| `unsafe` confined to `src/ffi.rs` | `make unsafe-count` | **312, all in `ffi.rs`** |
-| C reference suite is green *on this host* | `make test-reference` | **exit 0** (2026-08-01, [tests/README.md](tests/README.md#the-c-baseline--our-denominator)) |
-
-Three rows carry the weight, and they are not the obvious ones.
-
-**Row 1 is worth nothing without row 5.** lz4's tests do not link a prebuilt
-library — they compile `lib/*.c` themselves (§3). `multiconf.make` keys its
-object cache on the compiler and link flags but *not* on `C_SRCDIRS`, so a stale
-`lz4.o` built from the real `lib/lz4.c` can be relinked into a binary built with
-our overrides, with no duplicate-symbol error. `make test` then passes while
-testing C. `provenance-check` reads each binary's cached `.d` file, which records
-the path the compiler actually resolved through `vpath`, and fails if any came
-from `lib/`. It has caught this for real once. Together the two rows say: the
-suite passed, and the only implementation in those binaries was Rust.
-
-**Row 6 covers what the suite structurally cannot.** Upstream's tests are
-round-trips and CRCs, so wrong-but-valid compressed output passes them, and so
-does an error returned at the wrong offset. `fuzz/driver.sh` compiles the
-`fuzz/` harnesses twice — against `upstream/lib/liblz4.a` and against
-`target/release/liblz4_rs.a` — and compares the bytes. It also sweeps decode
-capacities across the fast path's 32-byte margin on corrupt and truncated input
-and compares the *position-encoded return code*, so it checks that both
-implementations give up in the same place. That sweep is what found the two
-decoder bugs in §8.4, one of which made `make test` fail about one run in twelve;
-nothing else in the project could see either.
-
-**What is still not true**, so that row 1 is not read as "done":
-
-* **One `frametest` unit assertion fails** — `LZ4F_cctx_size` against
-  hook-counted allocation (§8.1). The randomized `fuzzerTests` that exercise the
-  format are green.
-* **A debug build cannot run the fuzzer.** It aborts almost immediately on a
-  `slice::from_raw_parts` precondition check at `src/ffi.rs:170`, a null
-  `prefixStart` on the lz4hc path. Release is unaffected, but `debug_assert!`s
-  and overflow checks are currently unreachable through the suite.
-* **Release builds lost one fail-loud property** in `common_bytes` (§8.4).
-
-The last table row is the **denominator**: the original suite passes 100% for C
-on this machine, so any failure the port shows is attributable to the port.
-Re-run it after any host or toolchain change, and note that it leaves C-linked
-binaries on the shared paths — run `make provenance-check` before trusting
-anything built afterwards.
-
----
-
-# Part I — The entry: scope, eligibility, and the proof strategy
-
-What we took on, why it qualifies under the rules, and how the original test
-suite ends up testing Rust.
+The reference implementation is upstream LZ4 commit
+`0774d05537f9762f838f7ab541b7765f1a729cb5`.
 
 ## 1. Scope
 
-We port the **library** — `lib/` — and leave the command-line tool in C.
+### Port the library, not the CLI
 
-| File | SLOC (non-blank, non-comment) |
+The port covers the public library implemented by:
+
+| Upstream source | Purpose |
 |---|---|
-| `lib/lz4.c` | 2,036 |
-| `lib/lz4hc.c` | 1,791 |
-| `lib/lz4frame.c` | 1,519 |
-| `lib/lz4file.c` | 246 |
-| **Ported total** | **5,592** |
-| `lib/xxhash.c` (vendored dependency, see §6) | 692 |
-| Total including xxhash | 6,284 |
+| `lib/lz4.c` | Block compression and decompression |
+| `lib/lz4hc.c` | High-compression strategies |
+| `lib/lz4frame.c` | Frame format |
+| `lib/lz4file.c` | File helpers |
+| `lib/xxhash.c` | Vendored checksum dependency |
 
-Counted with:
+The four LZ4 library files total 5,592 non-blank, non-comment lines. Including
+the 692-line vendored xxHash dependency gives 6,284 C SLOC, below the
+hackathon's 8,000-line ceiling. Porting `programs/` as well would exceed that
+limit.
 
-```sh
-for f in lib/lz4.c lib/lz4hc.c lib/lz4frame.c lib/lz4file.c lib/xxhash.c; do
-  n=$(grep -v '^\s*$' $f | grep -v '^\s*[/*]' | wc -l); echo "$n  $f"
-done
-```
+The C CLI remains unchanged and links against the Rust library. This keeps the
+ported scope within the hackathon's source-line limit while making the original
+CLI integration tests exercise the Rust implementation end to end.
 
-Both figures sit inside the 1,000–8,000 line eligibility window, so the port
-qualifies whether or not the vendored dependency is counted.
+The library itself creates no threads and holds no locks. Its concurrency
+contract is therefore the absence of hidden mutable global state and the
+ability to share immutable objects such as `LZ4_CDict`. The implementation uses
+caller-owned or context-owned state and no mutable globals. The upstream CLI's
+threaded tests exercise this design on covered paths, but they are not a race
+detector.
 
-**Why not the CLI.** `programs/` is another **4,511 SLOC** (`lz4io.c` 2,907 raw
-lines, `lz4cli.c` 896, `bench.c` 865, `threadpool.c` 430, plus support). Porting
-it too would put the project at 10,795 SLOC — past the 8,000 ceiling, which the
-organisers set precisely because larger entries do not finish.
+### This is not a dependency wrapper
 
-*(An earlier revision of this section said 6,982 lines. That was `programs/*.c`
-plus `*.h` counted raw, compared against a non-blank/non-comment figure for
-`lib/` — apples to oranges, and it flattered the argument. Both numbers here are
-now SLOC on the same basis. The conclusion is unchanged: still over the
-ceiling.)*
+`lz4_flex` is an independent Rust implementation of the LZ4 format. It does not
+provide liblz4's complete C ABI, caller-allocated state layouts, frame surface,
+or all HC strategies. This project ports the pinned repository's API and
+behavior and does not depend on `lz4_flex`.
 
-Leaving `lz4cli.c` / `lz4io.c` in C is also *positively* useful: the C CLI links
-against our Rust library, so the `tests/test-lz4-*.sh` shell tests exercise the
-port end to end.
+## 2. ABI and Build Architecture
 
-### 1.1 Concurrency: there is none in `lib/`, and that is the point
+### Export the original library ABI
 
-The organisers' framing calls out "same concurrency semantics." Worth stating
-plainly where concurrency actually lives in this codebase, because the answer
-shapes what we owe:
+The crate builds as `staticlib`, `cdylib`, and `rlib`. The C-facing artifacts
+export the same 141 `LZ4_*`, `LZ4F_*`, and namespaced `LZ4_XXH*` symbols as the
+pinned `liblz4.a`.
 
-```sh
-grep -rlniE 'pthread|thread|mutex' lib/*.c     # lz4frame.c — comments only
-grep -rlniE 'pthread|thread|mutex' programs/*.c # threadpool.c, lz4io.c, lz4cli.c, util.c
-```
+The symbol contract was derived from the compiled C archive rather than only
+from headers. `make abi-check` compares that committed contract with the Rust
+archive. `tools/gen_ffi.py` was used to bootstrap `src/ffi.rs`; running
+`make gen-ffi` now overwrites implemented bodies and must not be part of normal
+development.
 
-`lib/` spawns no threads and holds no locks. Its only concurrency surface is a
-**contract**: `LZ4_CDict` "can be created once and shared by multiple threads
-concurrently, since its usage is read-only" (`lz4frame.h:596`), and every other
-API is caller-allocated with no global mutable state. Reproducing that contract
-means our port must have no hidden `static mut`, no lazily-initialised global
-table, no interior mutability behind a shared reference — which Rust enforces
-for us far more strictly than C did.
+### Run the unmodified upstream tests against Rust
 
-**This is now checked, not merely claimed** (2026-08-03). The C CLI's threadpool
-drives the library multi-threaded, so `make test` exercises our Rust
-concurrently, and any hidden global mutable state would corrupt output or trip a
-race. In the green end-to-end run, four `Using 6 threads for compression` lines
-appear in the log — and `make provenance-check` reports `rust  lz4`, so the CLI
-emitting them is the one linked against this port, not the C library. Thirteen
-`test-lz4-*.sh` cases ran through it and the suite exited 0.
+Upstream tests compile `lib/*.c` directly instead of linking a prebuilt
+`liblz4.a`. The project redirects that build through two ordinary Make
+variables:
 
-An earlier revision of this paragraph was careful to say the opposite, because
-the `Using 6 threads` line it quoted came from the **C** baseline run at a point
-when no function was implemented. Worth preserving as a caution: that line looks
-identical either way, and the only thing distinguishing them is which library
-the CLI was linked against.
+- `C_SRCDIRS` replaces upstream library sources with empty translation units in
+  `cstub/`.
+- `LDLIBS` links `target/release/liblz4_rs.a` and Rust's native static-library
+  dependencies.
 
-What this does *not* prove is absence of a data race — the suite is not run
-under a race detector, and LZ4's threads partition work by block rather than
-sharing state, so a latent race might simply not be exercised. What it does
-establish is the concrete claim §1.1 makes: no hidden global mutable state, on
-the paths the suite covers.
+The test Makefile clears `MAKEFLAGS` while building the CLI, so the CLI is built
+separately with the same overrides and marked complete when the suite runs.
+Without that step, shell tests can pass while exercising C rather than Rust.
 
-That coverage is **not automatic** — it has to be wired deliberately, and
-getting it wrong yields shell tests that pass while testing the C library. See
-§3.1.
+Upstream's object cache does not include `C_SRCDIRS` in its cache key. A stale C
+`lz4.o` can therefore be linked into an apparently Rust-backed test binary.
+`make provenance-check` inspects each binary's `lz4.d` and requires its primary
+`lz4.o` to come from `cstub/`. It catches the known stale-object failure mode;
+it is not a complete audit of every object in the binary.
 
----
+`test-amalgamation` is the one deliberate exception to the statement that
+upstream C implementation sources are not used by test binaries. It compiles an
+amalgamated C source as a standards-conformance check but does not link that
+object into a tested executable.
 
-## 2. Eligibility: no pre-existing port
+## 3. Layout and Ownership
 
-The rules bar porting a repository that has already been ported to the target
-language. A pure-Rust LZ4 implementation (`lz4_flex`) does exist, and we want
-to be explicit about why it does not disqualify this entry.
+### Probe caller-allocated layouts
 
-`lz4_flex` is an **independent reimplementation of the LZ4 wire format**, not a
-port of this repository. It does not expose liblz4's C ABI, does not implement
-the LZ4HC optimal parser, and covers only part of the frame API. What we are
-porting is *this codebase* — its API surface, its 141 exported symbols, its
-semantics, and its test suite. We did not read or depend on `lz4_flex`.
+Several public state types are allocated by C callers on their own stack. Their
+size and alignment are ABI, not implementation details. They cannot contain
+`Box`, `Vec`, `String`, or any other Rust-owned indirection.
 
-> **TODO (team):** paste the organisers' green-light ruling here verbatim,
-> with the date and where it was given.
+`build.rs` compiles a C probe against the pinned headers and emits the measured
+sizes and alignments. `src/types.rs` asserts the Rust representations against
+those values at compile time. This is necessary because values such as
+`LZ4_STREAM_MINSIZE` depend on `LZ4_MEMORY_USAGE`, and because types such as
+`XXH32_state_t` have less alignment than the other public states.
 
----
+The current build does not propagate arbitrary test-side `LZ4_MEMORY_USAGE`
+overrides into Cargo. A C caller and Rust library built with different values
+would disagree about state size. Supported builds must therefore use the same
+headers and configuration for both sides.
 
-## 3. Running the original test suite with zero edits to `tests/`
+### Keep opaque handles owned by Rust
 
-This needed care, because the obvious approach silently does nothing.
+Objects created and freed through opaque C APIs, such as frame contexts and
+file handles, are Rust-owned allocations represented by raw pointers at the
+boundary. `src/ffi.rs` is responsible for converting between those pointers and
+their Rust owners.
 
-**The trap:** lz4's tests do *not* link against a prebuilt library, The Makefile instead builds its own test binaries by compiling the c source files:
+### Honor custom allocators with a documented limit
 
-`tests/Makefile:122` builds
-`fuzzer` from `lz4.o lz4hc.o xxhash.o fuzzer.o`, and
-`build/make/multiconf.make:148` resolves those through
-`vpath %.c $(C_SRCDIRS)`, where `C_SRCDIRS = ../lib ../programs .`.
+`LZ4F_create*_advanced` allocates the context object through the caller's
+`LZ4F_CustomMem` hooks and returns it through the matching free hook. Internal
+working buffers remain Rust `Vec` allocations rather than allocations from the
+custom hooks.
 
-A Rust library dropped into `lib/` would be **bypassed entirely** as the C sources
-would still be compiled, the tests would pass, and they would be testing
-nothing.
+`LZ4F_cctx_size` reports the bytes observed by the caller's allocator, so the
+upstream hook-accounting assertion passes. Unlike C, that value does not include
+the Rust-heap working buffers. Full custom-allocator ownership would require
+placing the context and its working storage in hook-allocated blocks and
+tracking buffer offsets instead of `Vec`s.
 
-**The solution:.** Two ordinary make variables, overridden on the command line:
+## 4. xxHash
 
-```sh
-make -C tests test \
-  C_SRCDIRS="$LZ4_OXIDE/cstub $LZ4_SRC/programs ." \
-  LDLIBS="$LZ4_OXIDE/target/release/liblz4_rs.a $(rustc --print native-static-libs ...)"
-```
+The vendored xxHash implementation is ported in-tree rather than linked from C
+or delegated to a crate.
 
-* `C_SRCDIRS` drops the upstream `../lib` and substitutes `cstub/`, which holds five
-  intentionally-empty translation units (`lz4.c`, `lz4hc.c`, `lz4frame.c`,
-  `lz4file.c`, `xxhash.c`). The object names the makefile expects still get
-  produced; no C implementation object is linked into any test binary.
-* `LDLIBS` is appended to every link line by `multiconf.make:222`, so our Rust
-  archive resolves the symbols.
+The public `XXH32_state_t` and `XXH64_state_t` layouts are fixed by upstream
+headers and are allocated by C callers. A crate's private state cannot satisfy
+that ABI, and using a crate only for one-shot hashes would create two
+implementations of the same algorithm in one library.
 
-**No file under `tests/` is modified.** Not the C sources, not the shell
-scripts, not `tests/Makefile`. This is wrapped up as `make test`.
+`src/xxh.rs` therefore implements one-shot and streaming XXH32/XXH64 over the
+public layouts. `xxhash-rust` is a development-only oracle used by Rust tests;
+it is not linked into the shipped library.
 
-**One honest caveat.** `make test` includes `test-amalgamation`, whose rule
-(`tests/Makefile:207`) is `cat ../lib/lz4.c ../lib/lz4hc.c ../lib/lz4frame.c >
-lz4_all.c` and then compiles the result under `-std=c90 -Werror`. It names the
-paths literally, so `C_SRCDIRS` cannot redirect it, and the object is real: 116
-defined symbols. It is **never linked into anything** — it is upstream's
-standards-conformance check on its own sources — so no test binary contains C.
-But it means "no `lib/*.c` is ever compiled" would be false, and we do not say
-it. It also means one green test in the suite (`test-amalgamation`) would pass
-identically if this port did not exist.
+## 5. Safety and Errors
 
-### 3.1 The same trap, one level up: the CLI
+### Confine unsafe code to the FFI boundary
 
-`tests/Makefile:68-71` builds the CLI via a sub-make:
+`src/ffi.rs` is the only module allowed to use `unsafe`. It validates C
+arguments, forms slices or owned handles, and delegates to safe implementation
+modules. `src/block.rs`, `src/hc.rs`, `src/frame.rs`, `src/file.rs`, and
+`src/xxh.rs` use `#![forbid(unsafe_code)]`.
 
-```make
-lz4: MAKEFLAGS=
-lz4:
-	$(MAKE) -C $(PRGDIR) $@ CFLAGS="$(CFLAGS)"
-```
+`make unsafe-count` enforces the location policy. The number of occurrences is
+reported as evidence, not used as a manually maintained limit. The important
+invariant is that no unsafe operation enters codec logic.
 
-Command-line variable overrides reach sub-makes through `MAKEFLAGS`. Clearing
-it means `C_SRCDIRS` and `LDLIBS` **do not propagate into `programs/`**. Left
-alone, `make -C tests test` therefore builds the CLI from the C library, and
-every `tests/test-lz4-*.sh` passes while proving nothing about the port.
+### Preserve overlapping-buffer semantics
 
-`programs/Makefile:68` fortunately uses the same mechanism
-(`C_SRCDIRS = $(LIBLZ4DIR) .` plus `multiconf.make`), so the identical hook
-works there — it just has to be invoked explicitly. our `Makefile` builds the
-CLI as its own step with its own overrides, then runs the suite with `-o lz4`
-so the sub-make does not relink the CLI against C behind our back.
+Supported APIs permit source and destination ranges to overlap. Constructing
+separate `&[u8]` and `&mut [u8]` values over those ranges would violate Rust's
+aliasing rules. The FFI layer detects overlap and represents it as ranges within
+one mutable slice. Safe codec functions operate on that slice and its indices.
 
-A pleasant side effect: `multiconf.make` keys its object cache on a hash of the
-build flags, so the C reference build and the Rust build occupy different cache
-directories and can coexist. That is what the differential harness compares.
+### Keep C error encodings at the boundary
 
-### 3.2 On "no source-language runtime linking"
+liblz4 uses several incompatible C conventions: compression returns zero on
+failure, safe decompression returns position-encoded negative values, frame
+functions return encoded `size_t` errors, and xxHash returns status enums.
 
-The rule forbids leaning on the *source language's runtime* (the cited example
-is Python→Rust calling the Python interpreter). C has no such runtime, and we
-link none. What remains in C is the **test harness itself**, which is the thing
-we are required to keep unmodified — plus the CLI, by choice (§1).
+Block, frame, and file implementation paths use Rust error types internally,
+with `src/ffi.rs` translating them to the required C representation. Some HC
+internals retain `(written, consumed)` and zero-valued failure sentinels because
+their fill-output behavior has two observable results. Regardless of internal
+representation, only the original C conventions cross the ABI.
 
-Auditable claim: every `LZ4_*` / `LZ4F_*` symbol in the test binaries resolves
-into Rust, and no `lib/*.c` object participates in the link. `make abi-check` diffs the Rust archive's exports against the original's.
+## 6. Behavioral Equivalence
 
----
+### Require byte-identical deterministic output
 
-# Part II — Engineering decisions
+Round-trip tests cannot detect a compressor that emits valid but different
+bytes. Deterministic compression must therefore preserve upstream hash
+functions, table sizing, search order, skip heuristics, tie-breaking, and output
+limits exactly.
 
-How the port is built: the shape of the artefact, the types it must match, and
-the policies (`unsafe`, error handling) that govern the code inside it.
+Platform-dependent upstream behavior remains platform-dependent in the port.
+Hash reads use native endianness where C does, encoded offsets use little
+endianness, and table selection follows pointer width and probed configuration.
 
-## 4. Architecture: a Rust staticlib wearing liblz4's ABI
+### Compare rejection positions, not only valid output
 
-The single most important constraint is that lz4's test suite is written in
-**C**. `tests/fuzzer.c`, `tests/frametest.c`, `tests/roundTripTest.c` and
-friends call the library directly. To run those tests unmodified, our Rust code
-has to be callable *as C*.
+Safe decompression encodes the input position of a failure in its negative
+return value. Differential tests compare both produced bytes and exact return
+values on malformed and truncated input. This catches bounds decisions that
+ordinary round trips cannot observe.
 
-So the crate builds as `crate-type = ["staticlib", "cdylib", "rlib"]`,
-producing `liblz4_rs.a`, and exports one `#[no_mangle] extern "C"` function per
-symbol the original archive exports.
+`make difftest` currently covers:
 
-The symbol contract was taken from the real artefact rather than from the
-headers, so nothing is missed:
+- Fast block compression across table types, capacities, and input patterns.
+- Streaming and dictionary state transitions.
+- HC levels 1 through 12, including fill-output behavior and state transcripts.
+- Frame compression for eight preference combinations: linked and independent
+  blocks, checksums, block sizes, declared content size, and fast acceleration.
+- Block decompression rejection parity around the decoder's fast-path margins.
 
-```sh
-make -C lib liblz4.a
-nm --defined-only --extern-only lib/liblz4.a | awk '$2 ~ /^[TDBR]$/ {print $3}' | sort -u
-```
+The command does not currently cover malformed frame decompression or HC levels
+3 and above through the frame API. A zero-divergence result applies only to the
+matrix above.
 
-**141 symbols**: 51 core block codec, 32 high-compression, 39 frame/file, 19
-namespaced xxHash. `tools/gen_ffi.py` parses `lib/*.h`, generates the
-`extern "C"` skeleton, and cross-checks it against that list — it exits
-non-zero if any exported symbol has no stub. Regenerate with `make gen-ffi`.
+### Keep verification claims reproducible
 
----
+`make test` runs the unmodified upstream suite. `make provenance-check` checks
+the primary `lz4.o` provenance needed to attribute that result to the port.
+`make difftest` checks output and rejection behavior that the suite cannot see.
+None of those commands alone establishes all three properties.
 
-## 5. Caller-allocated state, and why sizes are probed not hardcoded
+## 7. Compatibility-Critical Implementation Choices
 
-lz4's API is caller-allocated. The C tests declare state **on their own stack**
-and hand us a pointer — e.g. `LZ4_stream_t stream;` in `fuzzer.c`, and
-`XXH64_state_t xxh64;` at `frametest.c:1202`. Consequences:
+### Compression tables and indices follow C
 
-1. Our Rust types must be `repr(C)` and match the C size and alignment exactly.
-   No `Box`, no `Vec`, no `String` in these structs — they must be
-   initialisable in place through a raw pointer.
-2. The sizes **cannot be hardcoded**. `LZ4_STREAM_MINSIZE` is
-   `(1UL << LZ4_MEMORY_USAGE) + 32`, and upstream permits `LZ4_MEMORY_USAGE` to
-   range 10..20 (`lz4.h:162-164`), which moves the struct size by three orders
-   of magnitude.
+Fast compression selects `byU16` for small inputs and `byU32` for larger or
+streaming inputs. The table width changes both storage and hash shift. Streaming
+indices are relative to `currentOffset`, including the deliberate 64 KiB offset
+advance used to make stale entries distinguishable.
 
-   *Scope correction:* an earlier revision claimed `tests/Makefile:214-215`
-   rebuilds the suite at both extremes. That target
-   (`test-compile-with-lz4-memory-usage`) only **compiles**, and is not a
-   prerequisite of `test:` — so `make test` never exercises either extreme.
-   Worse, nothing currently plumbs `LZ4_MEMORY_USAGE` from the C build into
-   cargo, so running that target with our overrides would leave the Rust side
-   at the probed 14 while C allocated a different size: silent stack
-   corruption, not a caught assert. Probing rather than hardcoding is still
-   right; the justification above is the honest one.
+HC state similarly uses absolute index space over prefix, external dictionary,
+and current input. `SrcView` keeps contiguous prefix/current data together so
+forward counting and backward catch-up cross the same boundaries as C.
 
-So `build.rs` compiles and runs a small C probe against the real headers
-and emits the true numbers as Rust constants. At the default
-`LZ4_MEMORY_USAGE=14`:
+### Match copies preserve LZ4 overlap behavior
 
-| Type | size | align |
+An LZ4 match may be longer than its offset. Its copy must read bytes produced by
+earlier steps of the same copy; a plain `memcpy`-style operation is incorrect.
+The block decoder uses safe fixed-width copies for short matches and a doubling
+copy for long repeated patterns.
+
+Wild copies are used only where upstream's margins prove that fixed-width
+overreads and overwrites remain within allocated slices. Near a boundary, the
+decoder uses exact copies.
+
+### Pointer-style bounds comparisons are expressed additively
+
+Upstream often compares against pointers such as `oend - 32`. On a buffer
+smaller than the margin, those conceptual pointers lie before the buffer.
+`usize::saturating_sub` does not preserve that ordering and can incorrectly
+enable a fast path at offset zero.
+
+The Rust decoder writes equivalent checks additively, for example
+`op + 32 <= oend` and `cpy + MFLIMIT > oend`. This avoids underflow while
+preserving C's branch decision. Detailed examples are in
+[PORTING.md](PORTING.md).
+
+### Prefix history is addressed lazily
+
+Prefix decode APIs describe history contiguous with the destination. The
+decoder must not copy or eagerly read all nominal history: callers can provide
+an addressable prefix that no encoded match actually references. The FFI layer
+forms one indexed region spanning history and output, and the decoder reads
+history only when a match requires it.
+
+### Frame decode history is content-owned
+
+The C frame decoder tracks whether history remains contiguous with caller
+output and avoids copies where possible. The Rust implementation keeps an owned
+64 KiB history. This simplifies lifetime and aliasing behavior and preserves
+decoded bytes because only history content affects decoding, but it costs a
+copy as history advances.
+
+## 8. Known Divergences and Unverified Areas
+
+| Area | Current behavior | Consequence |
 |---|---|---|
-| `LZ4_stream_t` | 16416 | 8 |
-| `LZ4_streamHC_t` | 262200 | 8 |
-| `LZ4_streamDecode_t` | 32 | 8 |
-| `XXH32_state_t` | 48 | **4** |
-| `XXH64_state_t` | 88 | 8 |
-| `LZ4F_preferences_t` | 56 | 8 |
-| `LZ4F_frameInfo_t` | 32 | 8 |
-| `LZ4F_CustomMem` | 32 | 8 |
-| `LZ4F_compressOptions_t` | 16 | 4 |
-| `LZ4F_decompressOptions_t` | 16 | 4 |
+| Frame compression levels 3 and above | Frame compression routes through the fast block compressor rather than HC. | Output is valid but can differ from C and may be larger. |
+| Malformed frame input | Differential rejection testing covers block decoding, not frame decoding. | Exact frame error parity is unverified. |
+| Frame custom allocators | Hooks own contexts but not internal `Vec` buffers. | Allocator ownership and `LZ4F_cctx_size` semantics differ from C. |
+| Debug HC calls | A null `prefixStart` can reach `slice::from_raw_parts` in `src/ffi.rs`. | Debug builds abort before the fuzzer can exercise assertions; release behavior is unaffected. |
+| Decoder fast loop | The safe decoder ports the two-stage shortcut but not upstream's full `LZ4_FAST_DEC_LOOP`. | Correctness is covered for the current loop; many-short-sequence throughput remains lower. |
+| Release fail-loudness | `common_bytes` clamps invalid indices after a debug assertion. | A broken internal precondition can become wrong output rather than a release panic. |
+| Build-time memory configuration | Cargo and C must use the same probed `LZ4_MEMORY_USAGE`. | Independently overriding only the C side can corrupt caller-allocated state. |
 
-`src/types.rs` asserts every one of these at compile time. The probe
-already earned its keep: `XXH32_state_t` is 4-aligned (all `uint32_t` members)
-where every other type is 8-aligned, so a blanket `repr(align(8))` — our first
-attempt — was wrong.
+The benchmark runner records the frame-HC divergence alongside its generated
+results. Performance measurements, environment details, and methodology live in
+[`bench/results.json`](bench/results.json) and
+[`bench/methodology.md`](bench/methodology.md), not in this log.
 
-`LZ4F_CustomMem` is on the list for a different reason: it is passed **by
-value** to `LZ4F_createCDict_advanced` and
-`LZ4F_createCompressionContext_advanced`. A by-value struct with a wrong layout
-does not fail to link — it silently corrupts. (It lives behind
-`LZ4F_STATIC_LINKING_ONLY`, `lib/lz4frame.h:641`, which `programs/Makefile:146`
-enables, so it is genuinely part of the shipped ABI.)
+## 9. Upstream Finding
 
----
+`LZ4_compress_destSize_extState` is declared in `lz4.h` without `LZ4LIB_API` or
+`LZ4LIB_STATIC_API`, although the symbol is present in `liblz4.a`. ELF static
+builds still export it, but a Windows DLL build can omit it because the missing
+macro normally supplies `__declspec(dllexport)`. The ABI generator found the
+discrepancy by comparing header declarations with symbols in the compiled
+archive.
 
-## 6. xxHash
+## 10. Verification
 
-`lib/xxhash.c` is **vendored**, not lz4 source: it is a copy of
-[Cyan4973/xxHash](https://github.com/Cyan4973/xxHash), as its own header states.
-Its history in this repo is 19 commits, almost all of the form "updated xxhash
-to latest version"; `lib/lz4.c` has 440. It is a dependency that happens to be
-checked in.
-
-**Decision: port it too, by hand, with no crate dependency.**
-
-We could have let the genuine C `xxhash.c` keep compiling (simply by omitting it
-from our stub directory). We chose not to: it would leave C objects in the
-shipped binaries and muddy the "no C implementation remains" claim.
-
-**Reversal (2026-08-01): we no longer use the `xxhash-rust` crate.** The first
-version of this section specified it. That is not implementable here, for the
-§5 reason: `XXH32_state_t` and `XXH64_state_t` are **fully specified in
-`lib/xxhash.h:264-285`** and the C tests declare them *on their own stack* —
-`XXH64_state_t xxh64;` at `frametest.c:1202`. The layout is therefore fixed by
-the C header:
-
-```c
-struct XXH32_state_s {          struct XXH64_state_s {
-   uint32_t total_len_32;          uint64_t total_len;
-   uint32_t large_len;             uint64_t v1, v2, v3, v4;
-   uint32_t v1, v2, v3, v4;        uint64_t mem64[4];
-   uint32_t mem32[4];              uint32_t memsize;
-   uint32_t memsize;               uint32_t reserved[2];
-   uint32_t reserved;           };  /* 88 bytes, align 8 */
-};  /* 48 bytes, align 4 */
-```
-
-No crate's private state type can match that, and `xxhash-rust` does not expose
-its internals, so we cannot even convert between the two at the boundary — the
-crate could only ever serve the one-shot `XXH32()`/`XXH64()` entry points, not
-the streaming ones. Splitting the two would mean *two* implementations of the
-same algorithm in one library, which is worse than either alone.
-
-So `src/xxh.rs` implements both hashes directly over a `repr(C)` state that
-mirrors the structs above. This is mechanical, spec-defined code (~250 lines);
-byte-exactness is not at risk, and it is covered by the `XXH32_canonical_*` /
-`XXH64_canonical_*` round-trips the suite already exercises.
-
-The crate does stay in the tree, as a **`[dev-dependencies]` test oracle**: unit
-tests hash the same buffers with both implementations, so ours is checked
-against a second implementation rather than only against itself. It is not
-linked into `liblz4_rs.a` — `cargo tree --edges normal` shows no dependencies.
-
-Scope note — the surface is larger than lz4 itself needs. LZ4's frame format
-only uses XXH32, but the **test harness** uses XXH64 heavily (~20 call sites in
-`frametest.c` alone, plus `fuzzer.c`, `roundTripTest.c`, `fullbench.c`). All 19
-symbols are exported under the `LZ4_XXH*` prefix because the suite is built with
-`-DXXH_NAMESPACE=LZ4_` (`tests/Makefile:43`), so our shim must match those exact
-names.
-
----
-
-## 7. `unsafe` policy
-
-Raw pointers are converted to slices immediately at the boundary and never
-propagate. Concretely:
-
-* `src/ffi.rs` — the only module permitted to use `unsafe`. Thin
-  entry points: validate, convert, delegate.
-* `src/{block,hc,frame,file,xxh}.rs` — each carries
-  `#![forbid(unsafe_code)]`. All real logic lives here, on slices.
-
-This keeps the unsafe surface small and, more importantly, *countable*:
+Use these commands for current evidence rather than copying volatile counts or
+performance values into this file:
 
 ```sh
-make unsafe-count
+make difftest          # byte identity and covered rejection parity
+make test              # complete unmodified upstream suite
+make abi-check         # exported symbol contract
+make provenance-check  # each binary's lz4.o comes from cstub/
+make kickoff-verify    # pinned upstream and unmodified tests
+make unsafe-count      # unsafe remains confined to src/ffi.rs
+cargo test             # Rust unit tests and xxHash oracle checks
+bench/bench.py         # regenerate benchmark results and environment metadata
 ```
-
-reports the raw occurrence count, the ported C SLOC it is measured against, the
-ratio per 1000 C SLOC, and **fails the build if any `unsafe` appears outside
-`src/ffi.rs`**. That last part is the real control; the number is the evidence.
-Budget: `unsafe` is permitted only in `ffi.rs`. The rule the build actually
-enforces is the *location*, not the count — `make unsafe-count` fails if a
-single occurrence appears anywhere else, and the number is evidence rather than
-a limit. As of 2026-08-02 it is **307 occurrences, 48.85 per 1000 ported C
-SLOC**, and it is dominated by the boundary being wide (141 exported functions,
-most of which convert two or three pointers) rather than by anything deep.
-
-The section above once said "only `slice::from_raw_parts{,_mut}` and in-place
-initialisation," and added that any other use is a decision belonging in this
-file. Four others exist, so here they are:
-
-| Construct | Why |
-|---|---|
-| `slice::from_raw_parts{,_mut}` (27) | The boundary conversion itself. |
-| `Box::into_raw` / `from_raw` (13) | Handles C owns and hands back: `LZ4F_CDict`, `LZ4_readFile_t`, `LZ4_writeFile_t`. The C API is create/free, which is exactly `Box`'s shape — the pointer is opaque to C and only ever returned to us. |
-| `core::mem::transmute` (3) | Only in `owned_new`/`owned_free`, turning `LZ4F_CustomMem`'s C function pointers into callable Rust ones. They arrive as raw `*mut c_void`-taking pointers and there is no safe cast for a fn-pointer type. |
-| `ptr::copy` (3) | Copying a decoded result into the caller's buffer where the destination is a bare pointer, not a slice we can own — including the `safeBuffer` staging in the ABI-compat path. |
-| `drop_in_place` / `addr_of` (3) | Dropping a value inside caller-allocated memory before the caller's own `free` reclaims the bytes (§8.1's `Owned<T>`). |
-
-None of these propagate: every one is confined to a single function whose
-callers see slices or `Result`. Adding a *fifth* kind is a decision, and belongs
-here.
-
-### 7.1 Error handling: `Result` inside, C codes only at the boundary
-
-An explicit exit criterion is *"handles error paths idiomatically — `Result`,
-not errno translated"*. That is in genuine tension with an ABI-compatible port,
-because liblz4's callers — including the unmodified C tests — require the
-original integer conventions, and those conventions are not even uniform:
-`LZ4_compress_default` returns `0` on failure, `LZ4_decompress_safe` returns a
-*negative* value, and the frame API returns a `size_t` that must be fed to
-`LZ4F_isError`.
-
-We resolve it by **separating the two representations**, rather than picking one:
-
-* `src/{block,hc,frame,file,xxh}.rs` — the actual implementation — is written
-  in idiomatic Rust and returns `Result<_, Error>`, where `Error` is a real
-  enum (`MalformedInput`, `OutputTooSmall`, …). No integer sentinels, no
-  errno-style out-params, no `-1` propagating through internal call graphs.
-* `src/ffi.rs` translates, once, at the outermost frame: `Result` in, C
-  integer convention out — per function, because the conventions differ.
-
-So the error *logic* is idiomatic and the error *encoding* is compatible. The
-translation is the boundary's job, which is what a boundary is for. A judge
-reading `src/block.rs` should see Rust, not transliterated C; a judge running
-`tests/fuzzer` should see lz4's exact return values.
-
-The one thing this does **not** do is invent richer errors than the original
-reports. Where C collapses several failure modes into a single `0`, we still
-return `0` — behavioural equivalence outranks expressiveness at the boundary,
-and the differential fuzzer checks exactly that.
-
----
-
-## 8. Observations about the original
-
-Recorded as we go; candidates for the Bug Catcher category.
-
-1. **`LZ4_compress_destSize_extState` is declared without an export macro.**
-   `lib/lz4.h:619` declares it as a bare `int LZ4_compress_destSize_extState(...)`,
-   while every neighbouring declaration carries `LZ4LIB_API` or
-   `LZ4LIB_STATIC_API`. The symbol *is* exported from `liblz4.a`, so on ELF
-   builds nobody notices — but on a Windows DLL build, `LZ4LIB_API` expands to
-   `__declspec(dllexport)`, and without it this function would not be exported.
-   Found because our generator cross-checks headers against the real archive's
-   symbol table and flagged the mismatch.
-
-> **TODO:** the last four upstream commits (`fix_read_oob`, `read_variable_length`
-> ilimit bounds, `ip` reaching `iend` in both decode loops) indicate the decode
-> bounds logic is freshly subtle. Point the differential fuzzer at truncated and
-> malformed input and compare *rejection* behaviour, not just agreement on valid
-> input.
-
----
-
-## 8.1 Frame format: two documented divergences
-
-Both are in `src/frame.rs`, neither changes a compressed byte, and both are
-verified against the C library rather than asserted.
-
-**The custom allocator is honoured for the context, not for its buffers.**
-`LZ4F_create*_advanced` takes an `LZ4F_CustomMem` — the caller's own
-alloc/calloc/free. We route the *context struct* through those hooks
-(`Owned<T>` in `src/ffi.rs`), so a caller that supplies an arena gets its
-context from that arena and freed back to it. The working buffers inside the
-context (`tmpBuff`, `tmpIn`, `tmpOutBuffer`, the history) are still `Vec<u8>`,
-i.e. Rust's allocator.
-
-The visible consequence is exactly one assertion:
-`frametest.c:1095-1115` installs counting hooks and requires
-`LZ4F_cctx_size(cc) == live_alloc_total_space`. Our reported size counts the
-buffers; the hooks never saw them, so the numbers differ and `unitTests` fails
-there. Everything after that assertion in the same test — including the whole
-randomized `fuzzerTests` run, which is the part that exercises the format — is
-green:
-
-```sh
-./upstream/tests/frametest -i25 -t1    # All tests completed
-```
-
-Closing it properly means carving all five buffers out of one hook-allocated
-block and tracking them as offsets, which is what C does. That is a real change
-to how `Cctx`/`Dctx` address their memory, not a patch, so it is recorded here
-rather than half-done. **This is the one unit-test assertion the frame port does
-not satisfy.**
-
-**`LZ4F_updateDict` is collapsed.** C's version (lz4frame.c:1558) is a
-five-branch juggle over whether the decoder's history currently lives in the
-caller's `dst` or in `tmpOutBuffer`, and whether the two happen to be adjacent
-in memory — all of it to avoid a copy. We keep an owned 64 KB history and copy
-into it, which makes every branch the same branch. The decoded bytes cannot
-differ: only the history's *content* feeds the decoder, never its address. The
-cost is one memcpy per block.
-
-The same reasoning does **not** license simplifying the compression side, and
-we did not: `withPrefix64k` vs `usingExtDict` there changes which matches are
-found. Picking the wrong one cost 6 bytes per multi-block frame and was caught
-only by byte-comparison against C, never by a round trip — see the note in
-`Cctx::make_block`.
-
-### How byte-identity was checked
-
-`fuzz/framediff.c` compresses stdin as a frame and is compiled twice, against
-`upstream/lib/liblz4.a` and against `target/release/liblz4_rs.a`. Run over
-`datagen` output at 1 KB / 64 KB / 200 KB / 1 MB / 4 MB, each at `-P10/50/90`,
-across eight preference combinations (default, independent blocks, content
-checksum, block checksum, 256 KB and 4 MB block sizes, declared content size,
-and fast level -3): **120 comparisons, all byte-identical.**
-
----
-
-## 8.2 HC: all three strategies ported, all 13 levels byte-identical
-
-`lz4hc.c:420-436` picks one of three match finders by level, and `src/hc.rs`
-implements all three:
-
-| Level | C strategy | Ported | Byte-identical to C |
-|---|---|---|---|
-| 1-2 | `lz4mid` | ✅ yes | ✅ **yes**, verified |
-| 3-9 | `lz4hc` (hash chain) | ✅ yes | ✅ **yes**, verified |
-| 10-12 | `lz4opt` (optimal parser) | ✅ yes | ✅ **yes**, verified |
-
-This section previously recorded the opposite, and it is worth keeping the
-reason it was written that way. Levels 3-12 were routed down to `lz4mid`: the
-output was well-formed LZ4 that round-tripped and passed every CRC in the
-suite, so `fuzzer` and `frametest` were green at all 13 levels — while a caller
-asking for level 9 got level-2 compression. On 120 KB of 4-symbol noise, C
-emitted 49,277 bytes at level 9 and 46,773 at level 11 where we emitted 56,424
-at every level.
-
-**Nothing in the upstream suite detected that**, and it would have cost 11 of
-13 reachable levels against the 30% of the score that is behavioural
-equivalence — `fuzzer.c:386` draws the level once per cycle and reuses it
-across ~15 HC call sites, so most cycles compressed through a strategy whose
-bytes we did not reproduce. It was visible only because this file said so and
-because `fuzz/hc_difftest.c` compared bytes against C rather than round-tripping.
-That is the argument for differential comparison in one paragraph: a green
-suite is evidence about crashes and CRCs, not about equivalence.
-
-Closing it meant `LZ4HC_compress_hashChain` (with `LZ4HC_InsertAndGetWiderMatch`
-and the chain-swap and pattern-analysis paths), `LZ4HC_compress_optimal`, and the
-`chainTable` maintenance in `LZ4HC_Insert` that `set_external_dict` and
-`LZ4_loadDictHC` had been able to skip while no chain existed to maintain.
-
-### What *is* verified, and the traps that made it hard
-
-The trap in porting `lz4mid` is that `LZ4HC_CCtx_internal` describes positions
-twice over: `prefixStart .. end` is one **contiguous** buffer holding the history
-followed by the current block, while `dictLimit`/`lowLimit` give the same bytes
-rising absolute indices. `LZ4_count` walks straight across the history/block
-seam and the catch-back loop reads backwards through it, so representing the two
-as separate slices changes which matches are found — invisibly, since the result
-still round-trips. `src/hc.rs` therefore takes one `SrcView::base` slice plus the
-block's offset within it, and the module header says so.
-
-Two smaller places where following C exactly matters, both commented in place:
-
-- The "fill table with beginning of match" writes use the `ipIndex` from the top
-  of the loop while `ip` itself has already moved (the `ip+1` peek and the
-  catch-back), so the stored index can disagree with the position hashed.
-  Faithful, and load-bearing.
-- `LZ4HC_compress_generic`'s dictCtx dispatch reads `position` **before**
-  `ctx->end += *srcSizePtr`. Computing it afterwards silently selects the wrong
-  arm; that bug survived a 12,000-case round-trip sweep and was caught only by
-  byte-comparison against C.
-
-### How byte-identity was checked
-
-`fuzz/hc_difftest.c` compiles twice — against `upstream/lib/liblz4.a` and
-against `target/release/liblz4_rs.a` — and emits a binary transcript of the
-whole HC surface: one-shot at generous/exact/one-byte-short capacity, external
-state fresh and fast-reset, streaming with a loaded dictionary, `saveDictHC`,
-both `destSize` (fillOutput) entry points across a range of capacities, and
-compression against an attached dictionary context. Failures and the
-`srcSizePtr` written back by the fillOutput calls are emitted too, so the
-comparison covers **rejection parity and how much input was consumed**, not just
-agreement on valid output. The `dictLimit`/`lowLimit`/`nextToUpdate`/`dirty`
-bookkeeping is emitted after each streaming call; pointers are not, being
-addresses rather than behaviour.
-
-Run over `datagen` output at 20 KB / 300 KB / 1 MB, each at `-P10/50/90`, at
-**every level 1-12: 108 transcripts, all byte-identical** (`fuzz/driver.sh`,
-which compares 116 including the frame codec).
-
----
-
-## 8.3 The prefix decode path: history must not be *read*, only addressed
-
-`LZ4_decompress_safe_withPrefix64k` and the prefix arm of
-`LZ4_decompress_safe{,_partial}_usingDict` segfaulted — `fullbench`
-decompressors #5, #6 and #8 — because `decompress_safe_histories` staged the
-decode through a scratch `Vec`: allocate `prefix_size + output_size`, **copy the
-prefix in**, decode, copy the result back out.
-
-The copy is the bug. C's decoder never reads the history up front; it reads a
-byte of it only when a match offset actually reaches back that far. The two
-differ whenever the prefix is nominally addressable but not really there, and
-that is not a corner case the suite stumbled into by accident —
-`fullbench.c:320` calls
-
-```c
-LZ4_decompress_safe_withPrefix64k(in, out, inSize, outSize);   /* out == orig_buff */
-```
-
-with `out` the head of a `malloc(benchedSize)`. The 64 KB "prefix" before it is
-unmapped. C is fine, because `fullbench` compressed that data with no
-dictionary, so no offset points below `out`. We touched all 65,536 bytes and
-died. Note that C is *also* reading a pointer it has no right to form here —
-this is arguably a latent bug in the harness — but the contract we owe is
-behavioural equivalence, and C's laziness makes it unobservable.
-
-The fix is to stop materialising the prefix and address it in place. A prefix is
-contiguous with `dst` **by definition** — it is the mode C selects exactly when
-`dictStart + dictSize == dst` — so one slice spans `[dst - prefix_size,
-dst + output_size)` with the block at offset `prefix_size`, and `low_prefix`
-arithmetic in `decompress_dict` already handles the rest unchanged. No scratch
-buffer, no copy back, and one fewer allocation per call on the hot path.
-
-The overlap case still needs care: `src` may lie *inside* the output allocation
-(in-place decompression, `LZ4_DECOMPRESS_INPLACE_BUFFER_SIZE`), and holding
-`&[u8]` and `&mut [u8]` over the same bytes is UB. That branch spans both
-regions into one slice and indexes in, the same trick `with_buffers` uses.
-
-**How it was checked.** `fuzzer -i3000`, `frametest -i50`, and all 13 `fullbench`
-decompressors (which CRC-check their output) are green, and `make test` passes
-end to end. For the paths this touches, a differential harness compiled twice —
-against `upstream/lib/liblz4.a` and against `target/release/liblz4_rs.a` —
-compares prefix mode, `withPrefix64k`, partial-in-prefix mode, external dict,
-in-place-with-prefix, and four malformed inputs, over six PRNG seeds and four
-sizes: **270 transcript lines, byte-identical, including the negative return
-values.** Round-trip alone would not have caught the original defect (it
-crashed rather than mis-decoded), but rejection parity is the half that silently
-drifts, so the return codes are in the transcript too.
-
----
-
-## 8.4 The block codec copies in bulk, and one of the two stated departures was wrong
-
-`src/block.rs` opens by recording two deliberate departures from the C. The
-first — **no wildcopy** — was justified on the grounds that `LZ4_wildCopy8`/`32`
-(lz4.c:466, :531) overwrite past the logical end of the data, and "in Rust that
-is a panic." **That premise is false**, and it cost real throughput.
-
-Every wildcopy call site in `safe_decode` is guarded so the overshoot lands
-*inside* the buffer: at lz4.c:2350 the guard is `cpy <= oend-MFLIMIT`, and
-`MFLIMIT` is 12 against a 7-byte overshoot; at lz4.c:2444 the copy stops at
-`oCopyLimit = oend-7`. C reserves the slack deliberately, and reading the guards
-rather than the comment above the function shows it. Overshooting was legal all
-along.
-
-What we ship now, and it is **still safe Rust** — `block.rs` keeps
-`#![forbid(unsafe_code)]` and `make unsafe-count` still reports every occurrence
-confined to `src/ffi.rs`:
-
-* `copy_match` — `copy_within` for disjoint regions; for an overlapping match,
-  one period materialised and then doubled. Each step reads only bytes an
-  earlier step finalised, so the pattern-repeat semantics that forbid a plain
-  `memmove` survive.
-* `copy_match_wild` / `Input::wild_copy_to` — fixed 8-byte steps that may write
-  up to 7 bytes past the run, used **only** where C's own guard proves the room.
-  `short_offset_prologue` ports the `inc32table`/`dec64table` trick
-  (lz4.c:2425), which repositions the source 8 bytes back so a sub-8 offset can
-  then be copied a word at a time. Its first four bytes stay sequential, because
-  below offset 4 each byte read there was written by the previous one — that
-  self-reference *is* the repeat the format encodes.
-* `common_bytes` — `LZ4_count`'s word compare plus a bit scan, with the scan
-  direction chosen by host endianness as `LZ4_NbCommonBytes` does.
-* `Input::as_slice` — the enum is matched once per scan, not once per byte.
-
-**`WILD_COPY_CUTOFF` is ours, not C's.** Below 32 bytes the fixed-width stores
-win, because calling `memcpy` for a handful of bytes costs more than the copy.
-Above it `memcpy` wins by a wide margin. C needs no such split: its wildcopy has
-no per-step bounds check to amortise. Removing the cutoff cost about a third of
-the decode throughput on literal-heavy input. The value is not sensitive —
-measured at 16/32/64/128/512, the spread sits inside the host's ~13%
-run-to-run noise.
-
-### What this measured, and what it ruled out
-
-`upstream/tests/fullbench`, built twice from the same `tests/Makefile` and
-confirmed by `make provenance-check` to link no `lib/*.c` object. 8 MB inputs,
-best-of-N, because single runs cannot resolve anything under ~13% here.
-`bench/bench.py` and `fuzz/driver.sh` reproduce all of it.
-
-| vs C | `-P20` | `-P50` | `-P90` | 8 MB zeroes |
-|---|---|---|---|---|
-| `LZ4_decompress_safe`, before | 0.91x | 0.46x | 0.21x | — |
-| `LZ4_decompress_safe`, now | **0.97x** | **0.73x** | **0.48x** | **2.50x** |
-| `LZ4_decompress_safe_usingDict`, now | 0.97x | 0.66x | 0.56x | 2.55x |
-| `LZ4_compress_default`, now | 0.37x | 0.36x | 0.54x | 0.56x |
-
-The discriminating variable is **sequence density, not compressibility**.
-`datagen -P<n>` sets the probability of emitting a match rather than a literal
-run (`datagen.c:131`), so `-P90` means *many short* matches, not few long ones.
-Reading the P50→P90 drop as "long matches" is the natural mistake and it is
-wrong — C slows down on `-P90` too (7729 → 5664 MB/s), which it would not if the
-matches were getting longer. The cost was per-sequence: one call into `memcpy`
-per sequence. On 8 MB of zeroes, which really is one enormous match, we run
-**2.5x faster than C**, because C is still stepping 8 bytes at a time where the
-doubling loop hands whole megabytes to `memmove`.
-
-The second stated departure — **one decode loop**, i.e. no `LZ4_FAST_DEC_LOOP` —
-is **untested**. It is the one aimed squarely at `-P90`-shaped data, and it is
-the largest remaining decode lever. Treat it as an open question, not a settled
-decision, and note that the shortcut inside `safe_decode` is already documented
-as *not* behaviour-preserving, so assume the fast loop changes what is accepted
-until a rejection-parity run proves otherwise.
-
-Compression sits at 0.36x and the copies were never its bottleneck: the
-word-at-a-time `common_bytes` bought about 18% and that was most of what was
-available there. What remains is per-scanned-position cost in the match search —
-`hash_position` reads through `Input::window`, and `Table::get`/`put` dispatch on
-the `U16`/`U32` enum, on every position examined. C pays none of it, because
-`LZ4_FORCE_INLINE` instantiates the compressor per `dict_directive` and table
-type. Monomorphising ours the same way is the next lever, and it is a refactor
-rather than an algorithm change.
-
-### The margin comparisons must be additive, not `saturating_sub`
-
-Reproducing the overcopy made a latent translation error load-bearing, and it is
-worth recording because the shape recurs everywhere in this decoder.
-
-C computes `oend - MFLIMIT`, `oend - 32` and `iend - 16` as **pointers**. On a
-block shorter than the margin those land before the buffer, so `op <= oend-32`
-is false and `cpy > oend-MFLIMIT` is true — either way the guarded fast path is
-unavailable and the careful path runs. `saturating_sub` clamps to `0` instead,
-and for the first sequence of a block written at offset 0 both comparisons flip
-the wrong way. Two bugs followed, both reachable only through a tiny output
-buffer, i.e. `LZ4_decompress_safe_partial` with a small `targetOutputSize`:
-
-* The two-stage shortcut ran on buffers smaller than its 32-byte margin, `op`
-  walked past `oend`, and `length = oend - op` underflowed. `fuzzer -i2000
-  -s7354` died on a 7-byte buffer. `tests/Makefile:327` seeds the fuzzer
-  randomly, so `test-fuzzer` was failing about **1 run in 12** — a suite that
-  is green on a lucky seed is not green.
-* The literal parsing restriction let a zero-length run take the unrestricted
-  branch. Harmless while that branch held an exact `memcpy`; once it became a
-  wildcopy that always moves 8 bytes, it wrote past a 1-byte buffer.
-
-Both are now written additively (`op + 32 <= oend`, `cpy + MFLIMIT > oend`),
-which cannot underflow and is exactly C's comparison. The lesson is in
-[PORTING.md §3.2](PORTING.md).
-
-### Rejection parity is what found it
-
-None of this is visible to a round trip: the inputs are corrupt or the capacity
-is far below the output size, so there is nothing to compare against. What
-discriminates is **the return code** — LZ4 position-encodes decode errors
-(`-(ip-src)-1`, lz4.c:2462), so comparing the integer compares *where* each
-implementation decided the block was malformed, not merely that it did.
-
-`fuzz/driver.sh` sweeps `LZ4_decompress_safe` and
-`LZ4_decompress_safe_partial` at capacities 1..4096 across the 32-byte margin,
-over clean, header-corrupted, mid-corrupted, tail-corrupted and truncated
-input, comparing that return code and a hash of the bytes actually produced:
-**1261/1261 identical.**
-
-It was 1234/1261 before this section's work — and **27 of those divergences
-predate the copy work entirely**. They were a pre-existing rejection-parity gap
-in `LZ4_decompress_safe` on corrupt input at small capacities, invisible to
-every test the project had, and the same additive guards fix them.
-
-### Where the port stands against C, and three places the gap is *not*
-
-2026-08-03, 8 MB `datagen -P50`, `bench/bench.py` best-of-N. Run-to-run spread
-on this host is ~13%, so treat anything closer than that as equal.
-
-| | C MB/s | Rust MB/s | ratio |
-|---|---|---|---|
-| `LZ4_decompress_fast` | 4796 | 3955 | 0.82x |
-| `LZ4_compress_HC` (level 9) | 81 | 61 | 0.75x |
-| `LZ4_decompress_safe` | 7802 | 5121 | 0.66x |
-| `LZ4_decompress_safe_usingDict` | 7886 | 5177 | 0.66x |
-| `LZ4_compress_default` | 1318 | 470 | **0.36x** |
-
-Decode is close to C; encode is not. `LZ4_decompress_fast` was 0.28x until the
-bulk-read change — it was reading literal runs through the FFI's byte closure
-one indirect call per byte, and choosing between external/prefix/output per byte
-in the match copy.
-
-**Compression's 3x is diffuse, and that is a measured claim, not a shrug.**
-`lz4.c` uses `LZ4_FORCE_INLINE` 31 times and ships 27 instantiations of the
-compressor with the dict directive and table type burned in as constants, where
-we dispatch at run time — so specialisation looks like the obvious answer. It
-is not, on this host:
-
-| Hypothesis | Ablation | Effect |
-|---|---|---|
-| Hash read dispatch (`Input` + `TableType`) | hard-code the `Separate`/`byU32` path | **+5%** |
-| Per-call table allocation | compare `LZ4_compress_default` (allocates) against `_extState` (caller's state) | **0%** — 0.37x vs 0.36x |
-| Table bounds checks | mask the index by `ENTRIES-1` so the optimiser can prove it | **0%** |
-
-Three sites at 5% each is 15%, not 3x. The cost is spread thin — `Option`
-construction in `Hist::read32`, a bounds check per windowed read, no
-cross-function specialisation — rather than concentrated anywhere a single
-change can reach. Note the first probe *added* a fast-path branch instead of
-removing dispatch, so 5% is a floor rather than a ceiling; the conclusion
-survives either reading.
-
-**Method, so the numbers are legible:** this was ablation, not profiling.
-Neither `perf` nor `valgrind` is installed on the dev host, so each hypothesis
-was tested by changing one thing and re-measuring. That is why the table above
-lists what was ruled *out*: with no profile, a negative result is the evidence.
-
-### One regression in fail-loudness, recorded deliberately
-
-`common_bytes` clamps its length against both slices, so a caller that violates
-C's precondition gets a short count instead of an out-of-bounds index. The
-byte-at-a-time loop it replaced *panicked* in that situation. This is a real
-loss: the stale-`active_hist` bug fixed in §8.2's work drove the match index to
-~4.29e9, which the old loop reported as "index out of bounds" and this one turns
-into wrong output — `fuzzer -i60 -s9` still catches it at cycle 54, but by
-comparing output rather than by crashing.
-
-A `debug_assert!` restores the loud failure in debug builds (and debug catches
-this particular case earlier still, via the `u32` overflow check in
-`Hist::dict_at`). **In release the clamp remains, and that class of bug remains
-quiet.** Dropping the clamp would restore the panic at the cost of crashing
-where C merely reads a word past the match end, which is why it is still there.
-
----
-
-## 9. Open items
-
-- [ ] **Build the Dockerfile once.** Still unverified: no Docker on the dev
-      host, which is how it was written in the first place. Static review did
-      find one certain failure — `Dockerfile:92` called `make difftest`, which
-      did not exist, and the `verify` stage it sits in is a prerequisite of
-      `artifacts`, `full-test` and the default image, so **every** target would
-      have failed. The target now exists and passes. That is a reason to trust
-      the file less, not more, until someone runs `docker build --target verify .`
-      on a host that has Docker: a review can only catch what it thinks to look
-      for.
-- [ ] Push to a public GitHub repo; correct the URL in `.port-mortem.toml`.
-- [x] **Every exported symbol has a body — no `unimplemented!()` remains**, and
-      `make test` passes end to end (§0). The panic-driven loop that `PLAN.md`
-      §5 and `CLAUDE.md` describe is finished; both still tell a newcomer to run
-      `fuzzer -i1` and implement whatever it names, which now names nothing.
-- [x] **HC hash chain and optimal parser ported (2026-08-03), see §8.2.** All
-      13 levels are now byte-identical to C, verified by 108 `hc_difftest`
-      transcripts. This was the largest behavioural-equivalence gap, and only
-      differential comparison could see it — the upstream suite was green
-      throughout, because level-2 output for a level-9 request is still valid
-      LZ4 that round-trips and passes every CRC.
-- [ ] **Frame contexts: move the working buffers into the caller's allocator**
-      (§8.1). One `frametest` unit assertion depends on it.
-- [ ] **Debug builds abort on a UB check** at `src/ffi.rs:170` —
-      `slice::from_raw_parts` on a null `prefixStart` in the lz4hc path, so the
-      fuzzer cannot run under `PROFILE=debug` and no `debug_assert!` or
-      overflow check is reachable through the suite. Release is unaffected.
-- [x] **Segfault in the prefix decode path — fixed (2026-08-02), see §8.3.**
-      Killed decompressors #5/#6/#8 in `fullbench` and stopped `make test` at
-      `test-fullbench`. `make test` now exits 0 end to end.
-- [ ] Differential fuzz harness (C reference vs Rust, valid **and** malformed input)
-      — `fuzz/hc_difftest.c` covers the HC surface (§8.2); `fuzz/driver.sh`
-      covers the block and frame codecs on valid input and the block decoder on
-      malformed input, **including rejection parity** (§8.4, 1261 comparisons).
-      Missing: the frame decoder on malformed input, and a generative loop
-      rather than a fixed sweep
-- [ ] Benchmark report: p99, RSS, startup, with methodology — throughput vs C
-      is done and reproducible (§8.4, `bench/`); p99, RSS and startup are not
-- [ ] **Port `LZ4_FAST_DEC_LOOP`** (§8.4). The second of `block.rs`'s two stated
-      departures, still untested, and the largest remaining decode lever on
-      many-short-sequence data. Deliberately *not* attempted before the
-      deadline: it introduces new margin comparisons (`ip < iend-15`,
-      `op < oend-64`) in exactly the class that produced two crashes and a
-      flaky suite, and `fuzz/driver.sh`'s capacity sweep covers the 32-byte
-      shortcut margin but not a 64-byte one. Whoever picks it up should extend
-      that sweep **first**, then write the margins additively from the outset.
-- [x] **Monomorphising the hot loops was measured and is not the win it looks
-      like** (§8.4). The `LZ4_FORCE_INLINE` count says specialise; ablation says
-      ~5% per site, against 0% for per-call allocation and 0% for table bounds
-      checks. Compression's gap is diffuse safe-Rust overhead. Recorded as a
-      closed question so nobody spends a day re-deriving it — if someone does
-      revisit it, get a profiler first, which this host did not have.
-- [ ] Paste organisers' eligibility ruling (§2)
-- [x] Confirm `LZ4F_compressOptions_t` / `LZ4F_decompressOptions_t` layouts
-      against the probe — done, both asserted in `src/types.rs` (§5)

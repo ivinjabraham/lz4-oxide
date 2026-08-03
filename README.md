@@ -10,22 +10,23 @@ skipped. That is the whole proof strategy. See [DECISIONS.md](DECISIONS.md).
 
 Upstream pinned at [`0774d055`](https://github.com/lz4/lz4/commit/0774d05537f9762f838f7ab541b7765f1a729cb5)
 (`v1.9.2-1552-g0774d055`). The port covers upstream's `lib/` (6,284 C SLOC),
-not `programs/`, [DECISIONS.md §1](DECISIONS.md) explains the scope.
+not `programs/`; [DECISIONS.md section 1](DECISIONS.md) explains the scope.
 
 ## Results at a glance
 
-Last verified 2026-08-03 on x86_64 Linux with rustc 1.97.1 and gcc 14.3.0.
+The latest benchmark environment and artifact hash are recorded in
+[`bench/results.json`](bench/results.json).
 
 | Claim | Result | Reproduce |
 |---|---:|---|
-| Original lz4 suite against Rust | exit 0, end to end | `make test` |
+| Original lz4 suite against Rust | exit 0, end to end | `make test && make provenance-check` |
 | Original test files matching kickoff hashes | 42/42 | `make kickoff-verify` |
-| `unsafe` occurrences | 312, all in `ffi.rs` | `make unsafe-count` |
+| `unsafe` boundary | all occurrences confined to `ffi.rs` | `make unsafe-count` |
 | Exported C ABI | 141/141 symbols | `make abi-check` |
-| Differential identity and rejection parity (block, stream, frame, HC) | 1369/1369 | `make difftest` |
+| Covered differential matrix | 0 divergences | `make difftest` |
 
-The full evidence, methodology, and remaining limitations are recorded in
-[DECISIONS.md §0](DECISIONS.md).
+The verification scope and remaining limitations are recorded in
+[DECISIONS.md sections 6 and 8](DECISIONS.md).
 
 ## Build and verify
 
@@ -37,16 +38,18 @@ cd lz4-oxide
 make difftest
 make test
 ```
- The C sources come from `upstream/`, a submodule pinned at the commit
+The C sources come from `upstream/`, a submodule pinned at the commit
 above, hence `--recursive`.
 
-`make difftest` checks byte identity and malformed-input rejection of the port against the
-pinned C implementation while `make test` runs the complete, unmodified upstream suite on it.
+`make difftest` checks covered byte identity and block-decoder rejection parity
+against the pinned C implementation. `make test` runs the complete, unmodified
+upstream suite against the port.
 
 ### Docker
 
-The Dockerfile can produce a verified library bundle or a runnable lz4 CLI
-linked against the Rust port:
+The Dockerfile is intended to produce a verified library bundle or a runnable
+lz4 CLI linked against the Rust port. Its targets have not yet been exercised on
+a host with Docker:
 
 ```sh
 docker build --target verify .
@@ -66,7 +69,7 @@ docker run --rm lz4-oxide --version
 | `make test-reference` | Run the same suite against the untouched C library |
 | `make test-quick` | `fuzzer` + `frametest` only — the edit/run loop |
 | `make abi-check` | Diff our exported symbols against the recorded original ABI |
-| `make provenance-check` | Prove each built test binary came from `cstub/`, not `lib/` |
+| `make provenance-check` | Check that each binary's primary `lz4.o` came from `cstub/` |
 | `make kickoff-verify` | Prove the original tests are byte-identical to kickoff |
 | `make unsafe-count` | `unsafe` count and ratio; fails if any escapes `ffi.rs` |
 
@@ -88,9 +91,9 @@ The one subtlety: lz4's tests don't link `liblz4.a` at all, they compile
 `lib/*.c` directly. We redirect that with two make variables (`C_SRCDIRS` and
 `LDLIBS`) rather than by editing anything. 
 
-The upstream CLI itself remains C, but its library calls resolve to Rust, so the original shell tests exercise the
-port end to end. DECISIONS.md §3 explains the test redirect, and §3.1 covers the
-same trap in the CLI build.
+The upstream CLI itself remains C, but its library calls resolve to Rust, so the
+original shell tests exercise the port end to end. [DECISIONS.md section
+2](DECISIONS.md) explains the test and CLI build redirects.
 
 ### Layout
 
@@ -115,17 +118,17 @@ handling lives in `ffi.rs`, so the port's unsafe surface stays confined to the F
 
 ## Behavioural equivalence
 
-Compressed output matches the C implementation **byte for byte** wherever the
-original is deterministic: same hash functions, same tie-breaking, same table
-sizing. Divergence there is invisible to round-trip tests and shows up only
-under differential fuzzing, which is why the port follows the original's search
-loops rather than improving on them.
+The covered block, streaming, HC, and frame preference paths match the C
+implementation **byte for byte**. Divergence is invisible to round-trip tests
+and shows up only under differential testing, which is why the port follows the
+original's search loops rather than improving on them. HC levels 3 and above
+through the frame API remain a documented exception.
 
-For the decoder the property is stronger than "valid input round-trips":
-**malformed input must be rejected identically**. Upstream's four most recent
-commits are all decode-bounds fixes, so that is where bugs live.
+For the block decoder the property is stronger than "valid input round-trips":
+covered malformed inputs must be rejected at the same offset. Malformed frame
+rejection parity is not yet covered.
 
-Run both differential harnesses with:
+Run the differential matrix with:
 
 ```sh
 make difftest
@@ -133,12 +136,13 @@ make difftest
 
 ## Performance
 
-Run `bench/bench.py` to rebuild provenance-checked C and Rust binaries, execute
-the complete benchmark matrix, and atomically replace the structured results.
+Run `bench/bench.py` to rebuild independently linked C and Rust binaries,
+execute the complete benchmark matrix, and atomically replace the structured
+results.
 The latest measurements are in [`bench/results.json`](bench/results.json), the
-methodology is in [`bench/methodology.md`](bench/methodology.md), and analysis
-is in [DECISIONS.md §8.4](DECISIONS.md). Keeping numeric results in the generated
-JSON avoids a stale second copy here.
+methodology is in [`bench/methodology.md`](bench/methodology.md), and known
+limitations are in [DECISIONS.md sections 6 and 8](DECISIONS.md).
+Keeping numeric results in the generated JSON avoids a stale second copy here.
 
 ## License
 

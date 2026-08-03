@@ -427,7 +427,7 @@ def measure_equivalence() -> dict:
         "cases": cases,
         "divergences": divergences,
         "command": "make difftest",
-        "known_divergence": "Frame API compression levels >= 3 use fast compression rather than HC compression; output remains valid but is larger.",
+        "known_divergence": "Frame API compression levels >= 3 use fast compression rather than HC compression; output remains valid but may be larger.",
     }
 
 
