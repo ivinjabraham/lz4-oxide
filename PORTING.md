@@ -471,7 +471,7 @@ has to be dealt with eventually.
 | File | Start with | Then |
 |---|---|---|
 | `src/block.rs` | `LZ4_versionString`/`LZ4_versionNumber`, `LZ4_compressBound` — trivial, and the first three the fuzzer demands | `LZ4_compress_default` → `LZ4_decompress_safe` → streaming/dict |
-| `src/xxh.rs` | `XXH32`/`XXH64` one-shot | streaming state (layout is fixed by `xxhash.h:264-285` — see DECISIONS.md section 5) |
+| `src/xxh.rs` | `XXH32`/`XXH64` one-shot | streaming state (layout is fixed by `xxhash.h:264-285` — see DECISIONS.md section 4) |
 | `src/frame.rs` | `LZ4F_compressBegin/Update/End` | decompression state machine, then dictionaries |
 | `src/hc.rs` | levels ≤2 (`lz4mid`, its own hashes + **two** tables) then 3–9 (`lz4hc` hash chain) | levels 10–12 (`lz4opt` optimal parser) — required for byte identity |
 | `src/file.rs` | thin layer over `frame.rs` | — |

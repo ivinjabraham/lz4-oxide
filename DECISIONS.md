@@ -21,52 +21,75 @@ The C CLI remains unchanged and links against the Rust library. This keeps the
 ported scope within the hackathon's source-line limit while making the original
 CLI integration tests exercise the Rust implementation end to end.
 
-## 3. Probe Caller-Allocated Layouts
+# 2. Probe Caller-Allocated Layouts
 
-Several public state types are allocated by C callers on their own stack. Their
-size and alignment are ABI, not implementation details. They cannot contain
-`Box`, `Vec`, `String`, or any other Rust-owned indirection.
+Some structs in this port are never allocated by our own code at all. The C
+test suite declares them itself — `LZ4_stream_t stream;`, sitting on its own
+stack — and just hands us a pointer into memory it already owns. For that to
+work, our Rust version of the struct has to have the exact same size and byte
+layout as C's, because C's code reads and writes specific offsets inside it no
+matter what Rust thinks the layout should be. Get this wrong and a C caller
+writing what it believes is one field silently corrupts a different one.
 
-`build.rs` compiles a C probe against the pinned headers and emits the measured
-sizes and alignments. `src/types.rs` asserts the Rust representations against
-those values at compile time. This is necessary because values such as
-`LZ4_STREAM_MINSIZE` depend on `LZ4_MEMORY_USAGE`, and because types such as
-`XXH32_state_t` have less alignment than the other public states.
+Those sizes can't just be typed in once and trusted, because they aren't
+fixed. `LZ4_STREAM_MINSIZE` depends on `LZ4_MEMORY_USAGE`, a build-time knob
+upstream lets range from 10 to 20 — enough on its own to move a struct's size
+by three orders of magnitude — and alignment isn't uniform either:
+`XXH32_state_t` only needs 4-byte alignment where the rest of these types need
+8. So instead of guessing, `build.rs` compiles a small C program against the
+real headers and asks the compiler directly how big and how aligned each
+struct actually is, and `src/types.rs` asserts the Rust definitions against
+those measured numbers at compile time. If a header ever changes and the
+numbers drift, this fails the build loudly instead of corrupting memory
+quietly at runtime.
 
-The current build does not propagate arbitrary test-side `LZ4_MEMORY_USAGE`
-overrides into Cargo. A C caller and Rust library built with different values
-would disagree about state size. Supported builds must therefore use the same
-headers and configuration for both sides.
+One consequence: Cargo has no way to know if a test build overrides
+`LZ4_MEMORY_USAGE`, so both sides have to be built against the same value, or
+the probed numbers and the real C struct will simply disagree.
 
-`LZ4F_CustomMem` is probed for a different reason: it crosses the boundary **by
+`LZ4F_CustomMem` needs the same care for a different reason: it's passed **by
 value**, not by pointer, into `LZ4F_createCDict_advanced` and
-`LZ4F_createCompressionContext_advanced`. A wrong layout on a by-value struct
-does not fail to link — it silently corrupts, with no pointer mismatch to
-catch it.
+`LZ4F_createCompressionContext_advanced`. A wrong layout here wouldn't even
+fail to link — there's no pointer-type mismatch to catch it — it would just
+silently corrupt whatever ends up at the wrong offset.
 
-## 4. Ownership
+# 3. Ownership
 
-### Keep opaque handles owned by Rust
+## Keep opaque handles owned by Rust
 
-Objects created and freed through opaque C APIs, such as frame contexts and
-file handles, are Rust-owned allocations represented by raw pointers at the
-boundary. `src/ffi.rs` is responsible for converting between those pointers and
-their Rust owners.
+A handful of APIs work like create/free pairs —
+`LZ4F_createCompressionContext` and its matching `LZ4F_free...` call, or the
+file read/write handles. C never inspects what's inside these objects; it just
+gets a pointer back from `create` and hands that same pointer to `free` later.
+Because C treats them as opaque, we're free to represent them however Rust
+normally would: allocate a real Rust value, hand C a raw pointer to it, and
+when the matching `free` call comes back, turn that pointer back into an owned
+value and let Rust drop it. `src/ffi.rs` is the only place this
+pointer-to-owner conversion happens, in either direction.
 
-### Honor custom allocators with a documented limit
+## Honor custom allocators with a documented limit
 
-`LZ4F_create*_advanced` allocates the context object through the caller's
-`LZ4F_CustomMem` hooks and returns it through the matching free hook. Internal
-working buffers remain Rust `Vec` allocations rather than allocations from the
-custom hooks.
+Some callers don't want the system allocator at all — an embedded target with
+its own arena, say — so the `_advanced` create functions accept an
+`LZ4F_CustomMem`: a small struct of function pointers standing in for
+`malloc`/`calloc`/`free`. Doing this completely faithfully would mean routing
+everything the context ever allocates through those hooks, not just the
+context struct itself but every scratch buffer it needs while compressing. We
+only do the first half: the context struct goes through the caller's hooks,
+but its internal working buffers stay as ordinary Rust `Vec`s, allocated from
+Rust's own heap.
 
-`LZ4F_cctx_size` reports the bytes observed by the caller's allocator, so the
-upstream hook-accounting assertion passes. Unlike C, that value does not include
-the Rust-heap working buffers. Full custom-allocator ownership would require
-placing the context and its working storage in hook-allocated blocks and
-tracking buffer offsets instead of `Vec`s.
+That's a real, measurable gap, not a free simplification. `LZ4F_cctx_size`
+reports how much memory the context is using, and upstream's own test suite
+checks that number against what the hooks actually saw allocated. Since our
+`Vec` buffers never went through the hooks, they're invisible to that check,
+so our reported size comes in smaller than a real C build's would. Closing
+this properly would mean carving those buffers out of one hook-allocated block
+and addressing them by offset instead of owning them separately as `Vec`s — a
+real restructuring, which is why it's recorded here rather than silently left
+as it is.
 
-## 5. xxHash
+# 4. xxHash
 
 The vendored xxHash implementation is ported in-tree rather than linked from C
 or delegated to a crate.
@@ -80,7 +103,7 @@ implementations of the same algorithm in one library.
 public layouts. `xxhash-rust` is a development-only oracle used by Rust tests;
 it is not linked into the shipped library.
 
-## 6. Confine Unsafe Code to the FFI Boundary
+# 5. Confine Unsafe Code to the FFI Boundary
 
 `src/ffi.rs` is the only module allowed to use `unsafe`. It validates C
 arguments, forms slices or owned handles, and delegates to safe implementation
@@ -91,16 +114,14 @@ modules. `src/block.rs`, `src/hc.rs`, `src/frame.rs`, `src/file.rs`, and
 reported as evidence, not used as a manually maintained limit. The important
 invariant is that no unsafe operation enters codec logic.
 
-## 7. Preserve Overlapping-Buffer Semantics
+# 6. Overlapping-Buffer Semantics
 
 Supported APIs permit source and destination ranges to overlap. Constructing
 separate `&[u8]` and `&mut [u8]` values over those ranges would violate Rust's
 aliasing rules. The FFI layer detects overlap and represents it as ranges within
 one mutable slice. Safe codec functions operate on that slice and its indices.
 
-## 8. Compatibility-Critical Implementation Choices
-
-### Compression tables and indices follow C
+# 7. Compression Tables and Indices Follow C
 
 Fast compression selects `byU16` for small inputs and `byU32` for larger or
 streaming inputs. The table width changes both storage and hash shift. Streaming
@@ -111,7 +132,7 @@ HC state similarly uses absolute index space over prefix, external dictionary,
 and current input. `SrcView` keeps contiguous prefix/current data together so
 forward counting and backward catch-up cross the same boundaries as C.
 
-### Match copies preserve LZ4 overlap behavior
+# 8. Match Copies Preserve LZ4 Overlap Behavior
 
 An LZ4 match may be longer than its offset. Its copy must read bytes produced by
 earlier steps of the same copy; a plain `memcpy`-style operation is incorrect.
@@ -128,7 +149,7 @@ no per-step call to amortize. Calling `memcpy` for the few bytes a typical
 sequence moves costs more than the copy; without the cutoff, literal-heavy
 input loses roughly a third of its decode throughput.
 
-### Pointer-style bounds comparisons are expressed additively
+# 9. Pointer-Style Bounds Comparisons Are Expressed Additively
 
 Upstream often compares against pointers such as `oend - 32`. On a buffer
 smaller than the margin, those conceptual pointers lie before the buffer.
@@ -140,7 +161,7 @@ The Rust decoder writes equivalent checks additively, for example
 preserving C's branch decision. Detailed examples are in
 [PORTING.md](PORTING.md).
 
-### Prefix history is addressed lazily
+# 10. Prefix History Is Addressed Lazily
 
 Prefix decode APIs describe history contiguous with the destination. The
 decoder must not copy or eagerly read all nominal history: callers can provide
@@ -148,7 +169,7 @@ an addressable prefix that no encoded match actually references. The FFI layer
 forms one indexed region spanning history and output, and the decoder reads
 history only when a match requires it.
 
-### Frame decode history is content-owned
+# 11. Frame Decode History Is Content-Owned
 
 The C frame decoder tracks whether history remains contiguous with caller
 output and avoids copies where possible. The Rust implementation keeps an owned
@@ -162,7 +183,7 @@ distinct. Collapsing them the same way once cost 6 bytes per multi-block
 frame — a difference invisible to round trips and caught only by
 byte-comparison against C.
 
-## 9. Known Divergences and Unverified Areas
+# 12. Known Divergences and Unverified Areas
 
 | Area | Current behavior | Consequence |
 |---|---|---|
@@ -179,7 +200,7 @@ results. Performance measurements, environment details, and methodology live in
 [`bench/results.json`](bench/results.json) and
 [`bench/methodology.md`](bench/methodology.md), not in this log.
 
-## 10. Upstream Finding
+# 13. Upstream Finding
 
 `LZ4_compress_destSize_extState` is declared in `lz4.h` without `LZ4LIB_API` or
 `LZ4LIB_STATIC_API`, although the symbol is present in `liblz4.a`. ELF static

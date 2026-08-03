@@ -18,7 +18,7 @@ The library port is complete at the exported-symbol level:
 
 These statements have different scopes. In particular, the differential matrix
 does not cover malformed frame decoding or HC levels 3 and above through the
-frame API. See [DECISIONS.md section 9](DECISIONS.md) for the complete
+frame API. See [DECISIONS.md section 12](DECISIONS.md) for the complete
 limitations table.
 
 ## Development Loop
