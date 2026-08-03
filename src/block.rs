@@ -1909,16 +1909,27 @@ pub fn decompress_dict(
     Ok(op - dst_start)
 }
 
-/// Legacy output-size-driven decoder. The source has no declared length, so
-/// the FFI layer supplies a byte reader rather than manufacturing a slice.
+/// Legacy output-size-driven decoder. The source has no declared length, so the
+/// FFI layer supplies readers rather than a slice — there is no length with
+/// which to build one, which is exactly why `LZ4_decompress_fast` is deprecated
+/// upstream.
+///
+/// Two readers, not one. `byte` serves the scalars (token, offset, length
+/// extensions), a handful per sequence. `read_into` bulk-copies a literal run in
+/// one go: reading a run through `byte` cost a closure call **per byte**, and
+/// with the match copy below going one byte at a time through a three-way
+/// branch, this entry point ran at 0.28x of C where `LZ4_decompress_safe`
+/// managed 0.66x.
 pub fn decompress_fast_with(
     mut byte: impl FnMut(usize) -> u8,
+    mut read_into: impl FnMut(&mut [u8], usize),
     output: &mut [u8],
     external: &[u8],
     prefix: &[u8],
 ) -> Result<usize, Error> {
     let mut ip = 0usize;
     let mut op = 0usize;
+    let history_len = external.len() + prefix.len();
     loop {
         let token = byte(ip) as usize;
         ip += 1;
@@ -1936,9 +1947,7 @@ pub fn decompress_fast_with(
         if output.len() - op < literal_length {
             return Err(Error::Malformed { consumed: ip });
         }
-        for index in 0..literal_length {
-            output[op + index] = byte(ip + index);
-        }
+        read_into(&mut output[op..op + literal_length], ip);
         ip += literal_length;
         op += literal_length;
         if output.len() - op < MFLIMIT {
@@ -1963,22 +1972,36 @@ pub fn decompress_fast_with(
             }
         }
         match_length += MINMATCH;
-        let history_len = external.len() + prefix.len();
         if output.len() - op < match_length || offset > history_len + op {
             return Err(Error::Malformed { consumed: ip });
         }
         if offset == 0 {
             output[op..op + match_length].fill(0);
         } else {
-            for index in 0..match_length {
-                let source = history_len + op - offset + index;
-                output[op + index] = if source < external.len() {
-                    external[source]
-                } else if source < history_len {
-                    prefix[source - external.len()]
-                } else {
-                    output[source - history_len]
-                };
+            // The match source is an index into one virtual stream —
+            // `[external][prefix][output]` — and a single match may cross both
+            // seams. Walk it a segment at a time instead of re-deciding which
+            // segment each byte belongs to, which is what the three-way branch
+            // this replaces did once per byte.
+            let mut src = history_len + op - offset;
+            let mut done = 0usize;
+            if src < external.len() {
+                let n = core::cmp::min(match_length, external.len() - src);
+                output[op..op + n].copy_from_slice(&external[src..src + n]);
+                done = n;
+                src += n;
+            }
+            if done < match_length && src < history_len {
+                let at = src - external.len();
+                let n = core::cmp::min(match_length - done, prefix.len() - at);
+                output[op + done..op + done + n].copy_from_slice(&prefix[at..at + n]);
+                done += n;
+                src += n;
+            }
+            if done < match_length {
+                // Inside the output itself, where the source may overlap what
+                // this is writing — so the repeat-aware copy, not a memmove.
+                copy_match(output, op + done, src - history_len, match_length - done);
             }
         }
         op += match_length;

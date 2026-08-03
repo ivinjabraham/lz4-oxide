@@ -727,8 +727,20 @@ unsafe fn decompress_fast_impl(
         unsafe { slice::from_raw_parts(prefix_address as *const u8, prefix_size) }
     };
     let mut output = vec![0u8; output_size as usize];
+    // Two readers over the same raw pointer. There is no compressed length
+    // here, so no slice can be formed over `src` — the decoder asks for exactly
+    // the bytes the format says are there, which is the same set C reads.
+    // `read_into` exists so a literal run costs one `memcpy` rather than one
+    // indirect call per byte.
     match block::decompress_fast_with(
         |index| unsafe { *src.cast::<u8>().add(index) },
+        |dst_slice, at| unsafe {
+            core::ptr::copy_nonoverlapping(
+                src.cast::<u8>().add(at),
+                dst_slice.as_mut_ptr(),
+                dst_slice.len(),
+            )
+        },
         &mut output,
         external,
         prefix,
