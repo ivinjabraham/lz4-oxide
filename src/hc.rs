@@ -446,14 +446,31 @@ pub fn fill_chain_table(state: &mut HcState, base: &[u8], target_pos: usize) {
 /// iterators reproduces the bounded behaviour without the over-read.
 #[inline(always)]
 fn count_match(a: &[u8], ai: usize, b: &[u8], bi: usize, a_limit: usize) -> usize {
+    // PROBE B: word-at-a-time like LZ4_count (lz4.c:696), first-mismatch via
+    // bit scan. Count is identical to the byte loop; only speed differs.
     if ai >= a_limit || bi >= b.len() {
         return 0;
     }
-    a[ai..a_limit]
-        .iter()
-        .zip(b[bi..].iter())
-        .take_while(|(x, y)| x == y)
-        .count()
+    let n = (a_limit - ai).min(b.len() - bi);
+    let mut k = 0;
+    while k + 8 <= n {
+        let x = u64::from_ne_bytes(a[ai + k..ai + k + 8].try_into().unwrap());
+        let y = u64::from_ne_bytes(b[bi + k..bi + k + 8].try_into().unwrap());
+        if x != y {
+            let diff = x ^ y;
+            let nb = if cfg!(target_endian = "little") {
+                diff.trailing_zeros() >> 3
+            } else {
+                diff.leading_zeros() >> 3
+            };
+            return k + nb as usize;
+        }
+        k += 8;
+    }
+    while k < n && a[ai + k] == b[bi + k] {
+        k += 1;
+    }
+    k
 }
 
 // --- Sequence encoding ------------------------------------------------------
