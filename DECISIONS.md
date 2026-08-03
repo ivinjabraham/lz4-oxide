@@ -23,9 +23,7 @@ The C CLI remains unchanged and links against the Rust library. This keeps the
 ported scope within the hackathon's source-line limit while making the original
 CLI integration tests exercise the Rust implementation end to end.
 
-## 3. Layout and Ownership
-
-### Probe caller-allocated layouts
+## 3. Probe Caller-Allocated Layouts
 
 Several public state types are allocated by C callers on their own stack. Their
 size and alignment are ABI, not implementation details. They cannot contain
@@ -48,6 +46,8 @@ value**, not by pointer, into `LZ4F_createCDict_advanced` and
 does not fail to link — it silently corrupts, with no pointer mismatch to
 catch it.
 
+## 4. Ownership
+
 ### Keep opaque handles owned by Rust
 
 Objects created and freed through opaque C APIs, such as frame contexts and
@@ -68,7 +68,7 @@ the Rust-heap working buffers. Full custom-allocator ownership would require
 placing the context and its working storage in hook-allocated blocks and
 tracking buffer offsets instead of `Vec`s.
 
-## 4. xxHash
+## 5. xxHash
 
 The vendored xxHash implementation is ported in-tree rather than linked from C
 or delegated to a crate.
@@ -82,7 +82,7 @@ implementations of the same algorithm in one library.
 public layouts. `xxhash-rust` is a development-only oracle used by Rust tests;
 it is not linked into the shipped library.
 
-## 5. Safety and Errors
+## 6. Safety and Errors
 
 ### Confine unsafe code to the FFI boundary
 
@@ -114,7 +114,7 @@ internals retain `(written, consumed)` and zero-valued failure sentinels because
 their fill-output behavior has two observable results. Regardless of internal
 representation, only the original C conventions cross the ABI.
 
-## 6. Behavioral Equivalence
+## 7. Behavioral Equivalence
 
 ### Require byte-identical deterministic output
 
@@ -154,7 +154,7 @@ the primary `lz4.o` provenance needed to attribute that result to the port.
 `make difftest` checks output and rejection behavior that the suite cannot see.
 None of those commands alone establishes all three properties.
 
-## 7. Compatibility-Critical Implementation Choices
+## 8. Compatibility-Critical Implementation Choices
 
 ### Compression tables and indices follow C
 
@@ -218,7 +218,7 @@ distinct. Collapsing them the same way once cost 6 bytes per multi-block
 frame — a difference invisible to round trips and caught only by
 byte-comparison against C.
 
-## 8. Known Divergences and Unverified Areas
+## 9. Known Divergences and Unverified Areas
 
 | Area | Current behavior | Consequence |
 |---|---|---|
@@ -235,7 +235,7 @@ results. Performance measurements, environment details, and methodology live in
 [`bench/results.json`](bench/results.json) and
 [`bench/methodology.md`](bench/methodology.md), not in this log.
 
-## 9. Upstream Finding
+## 10. Upstream Finding
 
 `LZ4_compress_destSize_extState` is declared in `lz4.h` without `LZ4LIB_API` or
 `LZ4LIB_STATIC_API`, although the symbol is present in `liblz4.a`. ELF static

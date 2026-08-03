@@ -215,7 +215,7 @@ lands inside the buffer (`cpy <= oend-MFLIMIT` with `MFLIMIT` 12 against a
 7-byte overshoot at `lz4.c:2350`; `oCopyLimit = oend-7` at `lz4.c:2444`). Write
 into `buf[op..op + 8]` where the guard proves those 8 bytes exist and nothing
 panics. See `copy_match_wild` and `Input::wild_copy_to` in `src/block.rs`, and
-[DECISIONS.md section 7](DECISIONS.md).
+[DECISIONS.md section 8](DECISIONS.md).
 
 What you *must* port faithfully either way are the **limit constants and the
 comparisons against them**, because those affect which parsing decisions get
@@ -471,7 +471,7 @@ has to be dealt with eventually.
 | File | Start with | Then |
 |---|---|---|
 | `src/block.rs` | `LZ4_versionString`/`LZ4_versionNumber`, `LZ4_compressBound` — trivial, and the first three the fuzzer demands | `LZ4_compress_default` → `LZ4_decompress_safe` → streaming/dict |
-| `src/xxh.rs` | `XXH32`/`XXH64` one-shot | streaming state (layout is fixed by `xxhash.h:264-285` — see DECISIONS.md section 4) |
+| `src/xxh.rs` | `XXH32`/`XXH64` one-shot | streaming state (layout is fixed by `xxhash.h:264-285` — see DECISIONS.md section 5) |
 | `src/frame.rs` | `LZ4F_compressBegin/Update/End` | decompression state machine, then dictionaries |
 | `src/hc.rs` | levels ≤2 (`lz4mid`, its own hashes + **two** tables) then 3–9 (`lz4hc` hash chain) | levels 10–12 (`lz4opt` optimal parser) — required for byte identity |
 | `src/file.rs` | thin layer over `frame.rs` | — |
@@ -479,7 +479,7 @@ has to be dealt with eventually.
 Port structure first, cleverness never. A faithful, boring translation that
 matches C byte for byte scores far better than idiomatic Rust that diverges.
 The place to be idiomatic is error handling and the internal API shape
-([DECISIONS.md section 5](DECISIONS.md)) — not the search loops.
+([DECISIONS.md section 6](DECISIONS.md)) — not the search loops.
 
 ---
 
