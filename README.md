@@ -14,7 +14,7 @@ not `programs/`, [DECISIONS.md §1](DECISIONS.md) explains the scope.
 
 ## Results at a glance
 
-Last verified 2026-08-03 on x86_64 Linux with rustc 1.97.1 and gcc 16.1.1.
+Last verified 2026-08-03 on x86_64 Linux with rustc 1.97.1 and gcc 14.3.0.
 
 | Claim | Result | Reproduce |
 |---|---:|---|
@@ -133,9 +133,11 @@ make difftest
 
 ## Performance
 
-On an 8 MB `datagen -P50` input, best-of-N throughput ranged from 0.66x–0.82x C
-for the measured decoders, 0.75x for HC level 9, and 0.36x for default
-compression. The commands and methodology are in
+Best-of-three throughput on an
+8 MB `datagen -P50` input is 0.61x C for default compression, 0.47x for
+streaming compression, 1.01x for fast decompression, and 0.76x for safe
+decompression. Across the P10/P50/P90/zero corpus, default compression ranges
+from 0.61x–0.73x C. The commands and methodology are in
 [`bench/methodology.md`](bench/methodology.md), structured measurements are in
 [`bench/results.json`](bench/results.json), and analysis is in
 [DECISIONS.md §8.4](DECISIONS.md).

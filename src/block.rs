@@ -700,7 +700,7 @@ fn hash5(sequence: u64, tt: TableType) -> u32 {
 /// lz4.c:806. `byU16` is excluded from `hash5` **even on 64-bit** — writing
 /// only the `hash5` path silently mis-hashes every input under 64 KB, which is
 /// most of what the fuzzer feeds us, while still round-tripping.
-#[inline]
+#[inline(always)]
 fn hash_position(input: &Input, buf: &[u8], at: usize, tt: TableType) -> u32 {
     if usize::BITS == 64 && tt != TableType::U16 {
         hash5(input.u64_ne(buf, at), tt)
@@ -739,7 +739,7 @@ fn nb_common_bytes(diff: u64) -> usize {
 /// well: every caller here satisfies C's precondition, so the extra caps never
 /// bind, and if one ever stopped satisfying it this returns a short count
 /// rather than reading out of bounds.
-#[inline]
+#[inline(always)]
 fn common_bytes(a: &[u8], i: usize, b: &[u8], j: usize, n: usize) -> usize {
     const STEP: usize = 8;
     // The clamps below are a guard, not an expected outcome: reaching them
@@ -827,6 +827,7 @@ fn count_hist(
 /// it is freshly constructed and discarded; for linked blocks the caller holds
 /// it across calls, which is the whole of what makes them "linked".
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn compress_generic(
     buf: &mut [u8],
     dst: Range<usize>,
@@ -1536,7 +1537,7 @@ pub fn compress_abi_ext_state(
 // ===========================================================================
 
 /// `read_variable_length` (lz4.c:1986). `None` is C's `rvl_error`.
-#[inline]
+#[inline(always)]
 fn read_variable_length(input: &Input, buf: &[u8], ip: &mut usize, ilimit: usize) -> Option<usize> {
     let mut length: usize = 0;
     if *ip >= ilimit {

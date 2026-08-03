@@ -3,6 +3,8 @@
   "measured_at": "2026-08-03",
   "environment": {
     "host": "x86-64 Linux 6.12.86",
+    "rustc": "1.97.1",
+    "gcc": "14.3.0",
     "upstream_commit": "0774d05537f9762f838f7ab541b7765f1a729cb5",
     "port_artifact": "target/release/liblz4_rs.a"
   },
@@ -11,6 +13,7 @@
     "throughput_repetitions": 3,
     "throughput_inner_iterations": 3,
     "throughput_summary": "best_of_runs",
+    "measurement_note": "Throughput was remeasured after force-inlining the block-codec hot paths; latency, memory, and startup were not remeasured.",
     "latency_input": "1 MiB",
     "latency_iterations": 10,
     "startup_trials": 20
@@ -24,16 +27,16 @@
   },
   "throughput_mib_per_s": {
     "hot_loop_p50_corpus": {
-      "compress_default": { "c": 1220, "rust": 462, "rust_to_c_ratio": 0.38 },
-      "compress_fast_continue": { "c": 953, "rust": 263, "rust_to_c_ratio": 0.28 },
-      "decompress_fast": { "c": 5670, "rust": 4924, "rust_to_c_ratio": 0.87 },
-      "decompress_safe": { "c": 9552, "rust": 5479, "rust_to_c_ratio": 0.57 }
+      "compress_default": { "c": 1726.2, "rust": 1044.9, "rust_to_c_ratio": 0.61 },
+      "compress_fast_continue": { "c": 1574.9, "rust": 744.0, "rust_to_c_ratio": 0.47 },
+      "decompress_fast": { "c": 5237.5, "rust": 5268.8, "rust_to_c_ratio": 1.01 },
+      "decompress_safe": { "c": 9955.3, "rust": 7520.8, "rust_to_c_ratio": 0.76 }
     },
     "corpus": {
-      "P10": { "c_compress": 3276, "rust_compress": 1512, "c_decompress": 32614, "rust_decompress": 29927 },
-      "P50": { "c_compress": 1755, "rust_compress": 680, "c_decompress": 11023, "rust_decompress": 6669 },
-      "P90": { "c_compress": 1251, "rust_compress": 659, "c_decompress": 8099, "rust_decompress": 4032 },
-      "zeros": { "c_compress": 32244, "rust_compress": 15035, "c_decompress": 29468, "rust_decompress": 59747 }
+      "P10": { "c_compress": 3437.7, "rust_compress": 2412.0, "c_decompress": 31278.9, "rust_decompress": 23772.9 },
+      "P50": { "c_compress": 1726.2, "rust_compress": 1044.9, "c_decompress": 9955.3, "rust_decompress": 7520.8 },
+      "P90": { "c_compress": 1259.4, "rust_compress": 857.6, "c_decompress": 8006.6, "rust_decompress": 4632.6 },
+      "zeros": { "c_compress": 17766.3, "rust_compress": 12924.6, "c_decompress": 29278.2, "rust_decompress": 59466.2 }
     }
   },
   "latency_microseconds": {
