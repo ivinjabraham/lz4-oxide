@@ -215,7 +215,7 @@ lands inside the buffer (`cpy <= oend-MFLIMIT` with `MFLIMIT` 12 against a
 7-byte overshoot at `lz4.c:2350`; `oCopyLimit = oend-7` at `lz4.c:2444`). Write
 into `buf[op..op + 8]` where the guard proves those 8 bytes exist and nothing
 panics. See `copy_match_wild` and `Input::wild_copy_to` in `src/block.rs`, and
-[DECISIONS.md section 8](DECISIONS.md).
+[DECISIONS.md section 7](DECISIONS.md).
 
 What you *must* port faithfully either way are the **limit constants and the
 comparisons against them**, because those affect which parsing decisions get

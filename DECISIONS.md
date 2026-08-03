@@ -13,45 +13,37 @@ The port covers the public library implemented by:
 | `lib/xxhash.c` | Vendored checksum dependency |
 
 The four LZ4 library files total 5,592 non-blank, non-comment lines. Including
-the 692-line vendored xxHash dependency gives 6,284 C SLOC, below the
-hackathon's 8,000-line ceiling. Porting `programs/` as well would exceed that
-limit.
+the 692-line vendored xxHash dependency gives 6,284 C SLOC — under the
+hackathon's 8,000-line ceiling. Porting `programs/` (the CLI, benchmark tool,
+and their support code) as well would push the total past that ceiling, so it
+stays in C.
 
-The C CLI remains unchanged and links against the Rust library. This keeps the
-ported scope within the hackathon's source-line limit while making the original
-CLI integration tests exercise the Rust implementation end to end.
+That turns out to help rather than just avoid a limit: since the CLI links
+against this port's library instead of the original, every one of upstream's
+CLI integration tests exercises the Rust implementation end to end, without
+the CLI itself needing to be ported at all.
 
-# 2. Probe Caller-Allocated Layouts
+# 2. Find caller-allocated layouts with build.rs 
 
 Some structs in this port are never allocated by our own code at all. The C
 test suite declares them itself — `LZ4_stream_t stream;`, sitting on its own
-stack — and just hands us a pointer into memory it already owns. For that to
+stack and just hands us a pointer into memory it already owns. For that to
 work, our Rust version of the struct has to have the exact same size and byte
 layout as C's, because C's code reads and writes specific offsets inside it no
-matter what Rust thinks the layout should be. Get this wrong and a C caller
-writing what it believes is one field silently corrupts a different one.
+matter what Rust thinks the layout should be.
 
 Those sizes can't just be typed in once and trusted, because they aren't
 fixed. `LZ4_STREAM_MINSIZE` depends on `LZ4_MEMORY_USAGE`, a build-time knob
-upstream lets range from 10 to 20 — enough on its own to move a struct's size
-by three orders of magnitude — and alignment isn't uniform either:
+upstream lets range from 10 to 20 and alignment isn't uniform either:
 `XXH32_state_t` only needs 4-byte alignment where the rest of these types need
 8. So instead of guessing, `build.rs` compiles a small C program against the
 real headers and asks the compiler directly how big and how aligned each
 struct actually is, and `src/types.rs` asserts the Rust definitions against
-those measured numbers at compile time. If a header ever changes and the
-numbers drift, this fails the build loudly instead of corrupting memory
-quietly at runtime.
-
-One consequence: Cargo has no way to know if a test build overrides
-`LZ4_MEMORY_USAGE`, so both sides have to be built against the same value, or
-the probed numbers and the real C struct will simply disagree.
+those measured numbers at compile time. 
 
 `LZ4F_CustomMem` needs the same care for a different reason: it's passed **by
 value**, not by pointer, into `LZ4F_createCDict_advanced` and
-`LZ4F_createCompressionContext_advanced`. A wrong layout here wouldn't even
-fail to link — there's no pointer-type mismatch to catch it — it would just
-silently corrupt whatever ends up at the wrong offset.
+`LZ4F_createCompressionContext_advanced`. 
 
 # 3. Ownership
 
@@ -69,8 +61,7 @@ pointer-to-owner conversion happens, in either direction.
 
 ## Honor custom allocators with a documented limit
 
-Some callers don't want the system allocator at all — an embedded target with
-its own arena, say — so the `_advanced` create functions accept an
+Some callers don't want the system allocator at all so the `_advanced` create functions accept an
 `LZ4F_CustomMem`: a small struct of function pointers standing in for
 `malloc`/`calloc`/`free`. Doing this completely faithfully would mean routing
 everything the context ever allocates through those hooks, not just the
@@ -85,126 +76,217 @@ checks that number against what the hooks actually saw allocated. Since our
 `Vec` buffers never went through the hooks, they're invisible to that check,
 so our reported size comes in smaller than a real C build's would. Closing
 this properly would mean carving those buffers out of one hook-allocated block
-and addressing them by offset instead of owning them separately as `Vec`s — a
-real restructuring, which is why it's recorded here rather than silently left
-as it is.
+and addressing them by offset instead of owning them separately as `Vec`s.
 
 # 4. xxHash
 
-The vendored xxHash implementation is ported in-tree rather than linked from C
-or delegated to a crate.
+LZ4 uses xxHash for checksums, and vendors its own copy of it rather than
+depending on it externally — so this port needs an xxHash implementation too.
+The obvious move is to pull in an existing Rust crate instead of hand-writing
+a hash function.
 
-The public `XXH32_state_t` and `XXH64_state_t` layouts are fixed by upstream
-headers and are allocated by C callers. A crate's private state cannot satisfy
-that ABI, and using a crate only for one-shot hashes would create two
-implementations of the same algorithm in one library.
+That doesn't work here, for the same reason structs in section 2 have to be
+probed rather than guessed: `XXH32_state_t` and `XXH64_state_t` are
+caller-allocated too, their layout fixed by the upstream headers, and no
+crate exposes its internal hash state in a way that matches that exact
+layout. Using a crate only for the one-shot `XXH32()`/`XXH64()` calls and
+hand-writing just the streaming state would also leave two separate
+implementations of the same algorithm living in one library.
 
-`src/xxh.rs` therefore implements one-shot and streaming XXH32/XXH64 over the
-public layouts. `xxhash-rust` is a development-only oracle used by Rust tests;
-it is not linked into the shipped library.
+So `src/xxh.rs` implements both the one-shot and streaming versions directly
+over the public layouts. `xxhash-rust` still appears in the tree, but only as
+a test oracle: Rust tests hash the same input with both implementations and
+compare, and it is never linked into the shipped library.
 
 # 5. Confine Unsafe Code to the FFI Boundary
 
-`src/ffi.rs` is the only module allowed to use `unsafe`. It validates C
-arguments, forms slices or owned handles, and delegates to safe implementation
-modules. `src/block.rs`, `src/hc.rs`, `src/frame.rs`, `src/file.rs`, and
-`src/xxh.rs` use `#![forbid(unsafe_code)]`.
+Every function this library exports takes raw C pointers — there's no way
+around that, since C is the one calling us. Turning a raw pointer into
+something Rust can safely work with, a slice or an owned value, is
+inherently an `unsafe` operation: the compiler can't prove the pointer is
+valid, it can only trust that the code checked.
 
-`make unsafe-count` enforces the location policy. The number of occurrences is
-reported as evidence, not used as a manually maintained limit. The important
-invariant is that no unsafe operation enters codec logic.
+The strategy is to do that conversion in exactly one place. `src/ffi.rs` is
+the only module allowed to use `unsafe` at all — it validates whatever C
+handed us, turns it into a slice or an owned Rust value, and immediately
+calls into ordinary safe code. Every other module — `src/block.rs`,
+`src/hc.rs`, `src/frame.rs`, `src/file.rs`, `src/xxh.rs` — carries
+`#![forbid(unsafe_code)]`, so the compiler itself refuses to build an
+`unsafe` block anywhere in the actual codec logic.
+
+`make unsafe-count` checks this automatically and reports how many `unsafe`
+blocks exist in total. That number is evidence of how small the boundary is,
+not a budget to hit — what matters is that the count outside `src/ffi.rs` is
+zero.
 
 # 6. Overlapping-Buffer Semantics
 
-Supported APIs permit source and destination ranges to overlap. Constructing
-separate `&[u8]` and `&mut [u8]` values over those ranges would violate Rust's
-aliasing rules. The FFI layer detects overlap and represents it as ranges within
-one mutable slice. Safe codec functions operate on that slice and its indices.
+Some of LZ4's APIs are explicitly designed to let source and destination
+overlap — compressing or decompressing a buffer in place, writing over data
+it's still reading from, so the caller doesn't need a second allocation. The
+natural Rust translation of "read from src, write to dst" is two separate
+references: an immutable `&[u8]` for the source and a mutable `&mut [u8]` for
+the destination. That's fine as long as they never overlap — but Rust's
+aliasing rules forbid a mutable and an immutable reference into the same
+memory at the same time, so the natural translation is illegal exactly when
+the API needs it most.
 
-# 7. Compression Tables and Indices Follow C
+Instead, the FFI layer represents both source and destination as ranges
+inside one single mutable slice. There's only ever one reference into the
+memory, so there's nothing for the aliasing rules to object to; the safe
+codec functions underneath just index into that one slice using the source
+and destination ranges instead of holding two references.
 
-Fast compression selects `byU16` for small inputs and `byU32` for larger or
-streaming inputs. The table width changes both storage and hash shift. Streaming
-indices are relative to `currentOffset`, including the deliberate 64 KiB offset
-advance used to make stale entries distinguishable.
+# 7. Match Copies Preserve LZ4 Overlap Behavior
 
-HC state similarly uses absolute index space over prefix, external dictionary,
-and current input. `SrcView` keeps contiguous prefix/current data together so
-forward counting and backward catch-up cross the same boundaries as C.
+LZ4 encodes repeated data as a match: "copy this many bytes from this far
+back in the output." Nothing requires the copy length to be shorter than
+that distance — an offset of 1 and a length of 50 means "repeat the last
+byte 50 times," which only works if the copy reads bytes that earlier steps
+of the very same copy just wrote. A plain `memcpy` assumes source and
+destination don't overlap and is free to read the whole source before
+writing any of it, which gives the wrong output here. The decoder instead
+uses a copy that's aware of this: fixed-width copies for short matches, and
+a doubling copy — copy what exists so far, then double the copied region,
+repeat — for long repeated runs, so each step only ever reads bytes an
+earlier step already wrote.
 
-# 8. Match Copies Preserve LZ4 Overlap Behavior
+C's decoder goes further for speed: it deliberately overshoots, writing a
+few bytes past where the match logically ends, because the buffer always has
+slack there and overwriting a little extra is cheaper than checking a length
+on every step. This port reproduces that same overshoot, but only where the
+very same margins C relies on prove the extra bytes are safe to write.
 
-An LZ4 match may be longer than its offset. Its copy must read bytes produced by
-earlier steps of the same copy; a plain `memcpy`-style operation is incorrect.
-The block decoder uses safe fixed-width copies for short matches and a doubling
-copy for long repeated patterns.
+Below about 32 bytes, though, the fixed-width approach loses to a plain
+`memcpy`/`memmove` call — a threshold C doesn't need, because its wildcopy
+has no per-call overhead to pay off. Skip the cutoff and literal-heavy input
+loses roughly a third of its decode throughput to `memcpy` calls that are
+each only moving a handful of bytes.
 
-Wild copies are used only where upstream's margins prove that fixed-width
-overreads and overwrites remain within allocated slices. Near a boundary, the
-decoder uses exact copies.
+# 8. Pointer-Style Bounds Comparisons Are Expressed Additively
 
-Below that, a length cutoff (~32 bytes) switches between fixed-width copies and
-`memcpy`/`memmove` — a threshold C has no equivalent of, since its wildcopy has
-no per-step call to amortize. Calling `memcpy` for the few bytes a typical
-sequence moves costs more than the copy; without the cutoff, literal-heavy
-input loses roughly a third of its decode throughput.
+C frequently writes bounds checks as pointer subtraction, like
+`if (op <= oend - 32)`. That works in C even when the buffer is smaller than
+the margin: `oend - 32` just becomes a pointer value that happens to sit
+before the start of the buffer, and comparing `op` against it is still
+meaningful. Rust has no such trick — a buffer's remaining length is an
+unsigned integer, and `oend - 32` on a small buffer would try to go
+negative. The obvious fix, `usize::saturating_sub`, clamps that result to
+zero instead of panicking, but zero is not the number C's negative pointer
+difference represents, so the comparison can silently take the wrong branch
+on small inputs — exactly the branch C's version would have rejected.
 
-# 9. Pointer-Style Bounds Comparisons Are Expressed Additively
+The decoder instead writes these checks with the addition on the other side,
+like `op + 32 <= oend`. That can never underflow, and it gives the identical
+true/false answer C's pointer subtraction does for every input size,
+including the small ones where the naive Rust translation gets it wrong.
 
-Upstream often compares against pointers such as `oend - 32`. On a buffer
-smaller than the margin, those conceptual pointers lie before the buffer.
-`usize::saturating_sub` does not preserve that ordering and can incorrectly
-enable a fast path at offset zero.
+# 9. Prefix History Is Addressed Lazily
 
-The Rust decoder writes equivalent checks additively, for example
-`op + 32 <= oend` and `cpy + MFLIMIT > oend`. This avoids underflow while
-preserving C's branch decision. Detailed examples are in
-[PORTING.md](PORTING.md).
+When a caller decodes with a prefix — history that sits immediately before
+the destination buffer in memory — the decoder is allowed to have matches
+reach back into that history. The tempting Rust translation is to copy the
+whole prefix into a working buffer up front, so the decoder only ever deals
+with one owned region. That's wrong here: a caller can legally hand over a
+prefix that's addressable in principle but not actually backed by real
+memory beyond what the compressed data will ever reference — C's own decoder
+never touches those bytes unless an actual match points at them, so nothing
+goes wrong. Reading the whole prefix eagerly would touch memory the caller
+never promised was there.
 
-# 10. Prefix History Is Addressed Lazily
+So the FFI layer instead forms one indexed region spanning both the prefix
+and the output, without copying anything into it, and the decoder only reads
+a byte of history at the moment some match's offset actually reaches back
+that far — exactly as lazily as C does.
 
-Prefix decode APIs describe history contiguous with the destination. The
-decoder must not copy or eagerly read all nominal history: callers can provide
-an addressable prefix that no encoded match actually references. The FFI layer
-forms one indexed region spanning history and output, and the decoder reads
-history only when a match requires it.
+# 10. Frame Decode History Is Content-Owned
 
-# 11. Frame Decode History Is Content-Owned
+Frame-format decoding can span many blocks, and later blocks' matches can
+reach back into up to 64 KiB of data decoded by earlier blocks — the decoder
+has to remember that history somewhere. C is careful about *where*:
+sometimes the history is literally still sitting in the caller's own output
+buffer, in which case nothing needs to move, and C tracks that case
+specifically to skip a copy that isn't necessary.
 
-The C frame decoder tracks whether history remains contiguous with caller
-output and avoids copies where possible. The Rust implementation keeps an owned
-64 KiB history. This simplifies lifetime and aliasing behavior and preserves
-decoded bytes because only history content affects decoding, but it costs a
-copy as history advances.
+This port doesn't make that distinction. It always keeps its own owned
+64 KiB copy of the history, regardless of where the caller's buffer happens
+to be. Decoding only ever depends on what bytes the history contains, never
+on their address, so this can't change the decoded output — it only costs
+one extra copy each time the history advances that C would sometimes have
+skipped.
 
-This reasoning does **not** extend to compression. There, `withPrefix64k` vs.
-`usingExtDict` changes which matches the search finds, so the two paths stay
-distinct. Collapsing them the same way once cost 6 bytes per multi-block
-frame — a difference invisible to round trips and caught only by
-byte-comparison against C.
+The same simplification is not safe on the compression side, and this port
+doesn't apply it there. There, which physical arrangement is in play —
+`withPrefix64k` versus `usingExtDict` — changes which matches the *search*
+finds, which is a real difference in output, not just bookkeeping.
+Collapsing the two paths the same way once did change the compressed bytes:
+it cost 6 bytes per multi-block frame, a difference invisible to a
+round-trip test and caught only by comparing bytes directly against C.
 
-# 12. Known Divergences and Unverified Areas
+# 11. Known Divergences and Unverified Areas
 
-| Area | Current behavior | Consequence |
-|---|---|---|
-| Frame compression levels 3 and above | Frame compression routes through the fast block compressor rather than HC. | Output is valid but can differ from C and may be larger. |
-| Malformed frame input | Differential rejection testing covers block decoding, not frame decoding. | Exact frame error parity is unverified. |
-| Frame custom allocators | Hooks own contexts but not internal `Vec` buffers. | Allocator ownership and `LZ4F_cctx_size` semantics differ from C. |
-| Debug HC calls | A null `prefixStart` can reach `slice::from_raw_parts` in `src/ffi.rs`. | Debug builds abort before the fuzzer can exercise assertions; release behavior is unaffected. |
-| Decoder fast loop | Implemented, verified byte-identical, measured, then **reverted**: slower than the general loop on every input tried (worst case -22%). Its speed in C comes from `goto`-ing into the middle of another loop, which Rust cannot express without doing the bail-out work up front on every sequence — so the port paid the cost C's control flow avoids. | The two-stage shortcut (ported) remains the fast path; many-short-sequence throughput is lower than C. |
-| Release fail-loudness | `common_bytes` clamps invalid indices after a debug assertion. | A broken internal precondition can become wrong output rather than a release panic. |
-| Build-time memory configuration | Cargo and C must use the same probed `LZ4_MEMORY_USAGE`. | Independently overriding only the C side can corrupt caller-allocated state. |
+A few places where this port knowingly doesn't match C, or hasn't been
+checked as thoroughly as the rest:
 
-The benchmark runner records the frame-HC divergence alongside its generated
-results. Performance measurements, environment details, and methodology live in
-[`bench/results.json`](bench/results.json) and
-[`bench/methodology.md`](bench/methodology.md), not in this log.
+**Frame compression at levels 3 and above** routes through the fast block
+compressor instead of the real HC compressor. The output is still valid
+LZ4 — it decodes correctly — but it isn't the same bytes C would produce,
+and it can be larger.
 
-# 13. Upstream Finding
+**Malformed frame input** isn't covered by the differential rejection
+testing that block decoding gets. Block-level malformed input is checked
+byte-for-byte and position-for-position against C's rejection behavior; the
+frame decoder's rejection behavior on bad input hasn't been verified the
+same way.
 
-`LZ4_compress_destSize_extState` is declared in `lz4.h` without `LZ4LIB_API` or
-`LZ4LIB_STATIC_API`, although the symbol is present in `liblz4.a`. ELF static
-builds still export it, but a Windows DLL build can omit it because the missing
-macro normally supplies `__declspec(dllexport)`. The ABI generator found the
-discrepancy by comparing header declarations with symbols in the compiled
-archive.
+**Custom allocators on the frame path** only own the context struct, not its
+internal working buffers (section 3), so `LZ4F_cctx_size` reports a smaller
+number than a real C build would for the same context.
+
+**A null `prefixStart` in the HC path can reach `slice::from_raw_parts` in
+`src/ffi.rs`.** In a debug build this triggers Rust's own
+undefined-behavior check and aborts before the fuzzer gets to run any of its
+own assertions. Release builds are unaffected — the debug check simply isn't
+compiled in.
+
+**The decoder's `LZ4_FAST_DEC_LOOP` was actually attempted, not skipped.**
+It was implemented, verified byte-identical to C, and measured — then
+reverted, because it was slower than the existing decode loop on every input
+tried, by as much as 22% in the worst case. C's version is fast because it
+jumps directly into the middle of another loop with a `goto`; Rust has no
+equivalent, so the port had to do that loop's bail-out work up front on
+every single sequence instead, which cost more than it saved. The two-stage
+shortcut this port already had stays as the fast path, and
+many-short-sequence throughput remains lower than C's.
+
+**`common_bytes` clamps an invalid index rather than panicking on it in
+release builds**, after already asserting against it in debug. A broken
+internal precondition — one that should never happen — would therefore show
+up as quietly wrong output in release, rather than a hard crash.
+
+**Cargo and C must be built against the same `LZ4_MEMORY_USAGE` value.**
+Nothing propagates a test-side override of that setting into the Cargo
+build, so overriding only the C side would make the two sides disagree about
+a caller-allocated struct's size (section 2).
+
+Performance measurements, environment details, and methodology for all of
+this live in [`bench/results.json`](bench/results.json) and
+[`bench/methodology.md`](bench/methodology.md), not here.
+
+# 12. Upstream Finding
+
+Every function liblz4 exports is normally declared with a macro —
+`LZ4LIB_API` or `LZ4LIB_STATIC_API` — that expands to whatever the platform
+needs to make a symbol visible outside the library. On Windows that's
+`__declspec(dllexport)`; without it, a function simply isn't part of the
+DLL's exported surface. `LZ4_compress_destSize_extState` is missing that
+macro in `lz4.h`, even though every neighboring declaration has one.
+
+On this port's own build (ELF, Linux) that's invisible — ELF doesn't need
+the macro to export a symbol, so the function shows up in `liblz4.a` either
+way. It would only actually break a Windows DLL build, where the function
+would silently fail to be exported. This was found because the tool that
+generates this port's FFI surface cross-checks every header declaration
+against the real compiled archive's symbol table, rather than trusting the
+headers alone, and flagged the one declaration that didn't match the
+pattern.
