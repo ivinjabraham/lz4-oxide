@@ -725,7 +725,7 @@ run-to-run noise.
 `upstream/tests/fullbench`, built twice from the same `tests/Makefile` and
 confirmed by `make provenance-check` to link no `lib/*.c` object. 8 MB inputs,
 best-of-N, because single runs cannot resolve anything under ~13% here.
-`bench/bench.sh` and `fuzz/driver.sh` reproduce all of it.
+`bench/bench.py` and `fuzz/driver.sh` reproduce all of it.
 
 | vs C | `-P20` | `-P50` | `-P90` | 8 MB zeroes |
 |---|---|---|---|---|
@@ -807,7 +807,7 @@ every test the project had, and the same additive guards fix them.
 
 ### Where the port stands against C, and three places the gap is *not*
 
-2026-08-03, 8 MB `datagen -P50`, `bench/bench.sh` best-of-N. Run-to-run spread
+2026-08-03, 8 MB `datagen -P50`, `bench/bench.py` best-of-N. Run-to-run spread
 on this host is ~13%, so treat anything closer than that as equal.
 
 | | C MB/s | Rust MB/s | ratio |

@@ -104,7 +104,7 @@ src/
   file.rs     lz4file.c   — file API
   xxh.rs      xxhash      — checksums
 fuzz/         differential drivers for block, stream, frame and HC APIs
-bench/        parity checks and reproducible C-vs-Rust throughput scripts
+bench/        one-command C-vs-Rust benchmark runner and structured results
 cstub/        empty .c files that displace lib/*.c in the test build
 tools/        gen_ffi.py, used to bootstrap the original FFI skeleton
 build.rs      probes the C headers for struct sizes and alignments
@@ -133,14 +133,12 @@ make difftest
 
 ## Performance
 
-Best-of-three throughput on an
-8 MB `datagen -P50` input is 0.61x C for default compression, 0.47x for
-streaming compression, 1.01x for fast decompression, and 0.76x for safe
-decompression. Across the P10/P50/P90/zero corpus, default compression ranges
-from 0.61x–0.73x C. The commands and methodology are in
-[`bench/methodology.md`](bench/methodology.md), structured measurements are in
-[`bench/results.json`](bench/results.json), and analysis is in
-[DECISIONS.md §8.4](DECISIONS.md).
+Run `bench/bench.py` to rebuild provenance-checked C and Rust binaries, execute
+the complete benchmark matrix, and atomically replace the structured results.
+The latest measurements are in [`bench/results.json`](bench/results.json), the
+methodology is in [`bench/methodology.md`](bench/methodology.md), and analysis
+is in [DECISIONS.md §8.4](DECISIONS.md). Keeping numeric results in the generated
+JSON avoids a stale second copy here.
 
 ## License
 

@@ -1,58 +1,116 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "measured_at": "2026-08-03",
+  "generated_by": "bench/bench.py",
   "environment": {
-    "host": "x86-64 Linux 6.12.86",
+    "host": "x86_64 Linux 6.12.86",
     "rustc": "1.97.1",
     "gcc": "14.3.0",
     "upstream_commit": "0774d05537f9762f838f7ab541b7765f1a729cb5",
-    "port_artifact": "target/release/liblz4_rs.a"
+    "port_artifact": "target/release/liblz4_rs.a",
+    "port_artifact_sha256": "1188df3ef702fa271e8876ddccec9aac2ad982ef7042949a36804b786951310b"
   },
   "methodology": {
     "throughput_input": "8 MiB",
     "throughput_repetitions": 3,
     "throughput_inner_iterations": 3,
     "throughput_summary": "best_of_runs",
-    "measurement_note": "Throughput was remeasured after force-inlining the block-codec hot paths; latency, memory, and startup were not remeasured.",
     "latency_input": "1 MiB",
-    "latency_iterations": 10,
+    "latency_trials": 10,
+    "latency_summary": "fullbench throughput converted to microseconds per 1 MiB call",
     "startup_trials": 20
   },
   "equivalence": {
-    "block_frame_rejection_cases": 1261,
-    "block_frame_rejection_divergences": 0,
-    "hc_block_cases": 108,
-    "hc_block_divergences": 0,
+    "cases": 1369,
+    "divergences": 0,
+    "command": "make difftest",
     "known_divergence": "Frame API compression levels >= 3 use fast compression rather than HC compression; output remains valid but is larger."
   },
-  "throughput_mib_per_s": {
+  "throughput_mb_per_s": {
     "hot_loop_p50_corpus": {
-      "compress_default": { "c": 1726.2, "rust": 1044.9, "rust_to_c_ratio": 0.61 },
-      "compress_fast_continue": { "c": 1574.9, "rust": 744.0, "rust_to_c_ratio": 0.47 },
-      "decompress_fast": { "c": 5237.5, "rust": 5268.8, "rust_to_c_ratio": 1.01 },
-      "decompress_safe": { "c": 9955.3, "rust": 7520.8, "rust_to_c_ratio": 0.76 }
+      "compress_default": {
+        "c": 1823.4,
+        "rust": 1169.7,
+        "rust_to_c_ratio": 0.64
+      },
+      "compress_fast_continue": {
+        "c": 1721.0,
+        "rust": 820.5,
+        "rust_to_c_ratio": 0.48
+      },
+      "decompress_fast": {
+        "c": 5773.0,
+        "rust": 5956.6,
+        "rust_to_c_ratio": 1.03
+      },
+      "decompress_safe": {
+        "c": 11344.5,
+        "rust": 7412.7,
+        "rust_to_c_ratio": 0.65
+      }
     },
     "corpus": {
-      "P10": { "c_compress": 3437.7, "rust_compress": 2412.0, "c_decompress": 31278.9, "rust_decompress": 23772.9 },
-      "P50": { "c_compress": 1726.2, "rust_compress": 1044.9, "c_decompress": 9955.3, "rust_decompress": 7520.8 },
-      "P90": { "c_compress": 1259.4, "rust_compress": 857.6, "c_decompress": 8006.6, "rust_decompress": 4632.6 },
-      "zeros": { "c_compress": 17766.3, "rust_compress": 12924.6, "c_decompress": 29278.2, "rust_decompress": 59466.2 }
+      "P10": {
+        "c_compress": 3565.6,
+        "rust_compress": 2475.8,
+        "c_decompress": 34643.3,
+        "rust_decompress": 26430.4
+      },
+      "P50": {
+        "c_compress": 1823.4,
+        "rust_compress": 1169.7,
+        "c_decompress": 11344.5,
+        "rust_decompress": 7412.7
+      },
+      "P90": {
+        "c_compress": 1252.0,
+        "rust_compress": 896.7,
+        "c_decompress": 8223.4,
+        "rust_decompress": 4734.2
+      },
+      "zeros": {
+        "c_compress": 18321.9,
+        "rust_compress": 13179.9,
+        "c_decompress": 30708.3,
+        "rust_decompress": 62679.7
+      }
     }
   },
   "latency_microseconds": {
-    "compress_default": { "c_p50": 546, "c_p99": 556, "rust_p50": 1446, "rust_p99": 1446 },
-    "decompress_safe": { "c_p50": 28, "c_p99": 28, "rust_p50": 60, "rust_p99": 78 }
+    "compress_default": {
+      "c_p50": 533.3,
+      "c_max": 549.3,
+      "rust_p50": 905.8,
+      "rust_max": 982.4
+    },
+    "decompress_safe": {
+      "c_p50": 28.5,
+      "c_max": 29.7,
+      "rust_p50": 57.4,
+      "rust_max": 60.8
+    }
   },
   "memory": {
-    "peak_rss_mebibytes": { "c_cli": 12, "rust_cli": 23 },
+    "peak_rss_mebibytes": {
+      "c_cli": 13.7,
+      "rust_cli": 35.1
+    },
     "binary_size": {
-      "c_cli_kib": 341,
-      "rust_cli_unstripped_mebibytes": 5.2,
-      "rust_cli_stripped_mebibytes": 1.2
+      "c_cli_kib": 351.8,
+      "rust_cli_unstripped_mebibytes": 5.15,
+      "rust_cli_stripped_mebibytes": 1.15
     }
   },
   "startup_milliseconds": {
-    "c_cli": { "min": 0.2, "p50": 0.3, "p99": 0.7, "max": 0.7 },
-    "rust_cli": { "min": 0.2, "p50": 0.3, "p99": 0.4, "max": 0.4 }
+    "c_cli": {
+      "min": 0.23,
+      "p50": 0.314,
+      "max": 0.706
+    },
+    "rust_cli": {
+      "min": 0.377,
+      "p50": 0.496,
+      "max": 0.589
+    }
   }
 }
