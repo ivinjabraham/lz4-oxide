@@ -82,9 +82,7 @@ implementations of the same algorithm in one library.
 public layouts. `xxhash-rust` is a development-only oracle used by Rust tests;
 it is not linked into the shipped library.
 
-## 6. Safety and Errors
-
-### Confine unsafe code to the FFI boundary
+## 6. Confine Unsafe Code to the FFI Boundary
 
 `src/ffi.rs` is the only module allowed to use `unsafe`. It validates C
 arguments, forms slices or owned handles, and delegates to safe implementation
@@ -95,64 +93,12 @@ modules. `src/block.rs`, `src/hc.rs`, `src/frame.rs`, `src/file.rs`, and
 reported as evidence, not used as a manually maintained limit. The important
 invariant is that no unsafe operation enters codec logic.
 
-### Preserve overlapping-buffer semantics
+## 7. Preserve Overlapping-Buffer Semantics
 
 Supported APIs permit source and destination ranges to overlap. Constructing
 separate `&[u8]` and `&mut [u8]` values over those ranges would violate Rust's
 aliasing rules. The FFI layer detects overlap and represents it as ranges within
 one mutable slice. Safe codec functions operate on that slice and its indices.
-
-### Keep C error encodings at the boundary
-
-liblz4 uses several incompatible C conventions: compression returns zero on
-failure, safe decompression returns position-encoded negative values, frame
-functions return encoded `size_t` errors, and xxHash returns status enums.
-
-Block, frame, and file implementation paths use Rust error types internally,
-with `src/ffi.rs` translating them to the required C representation. Some HC
-internals retain `(written, consumed)` and zero-valued failure sentinels because
-their fill-output behavior has two observable results. Regardless of internal
-representation, only the original C conventions cross the ABI.
-
-## 7. Behavioral Equivalence
-
-### Require byte-identical deterministic output
-
-Round-trip tests cannot detect a compressor that emits valid but different
-bytes. Deterministic compression must therefore preserve upstream hash
-functions, table sizing, search order, skip heuristics, tie-breaking, and output
-limits exactly.
-
-Platform-dependent upstream behavior remains platform-dependent in the port.
-Hash reads use native endianness where C does, encoded offsets use little
-endianness, and table selection follows pointer width and probed configuration.
-
-### Compare rejection positions, not only valid output
-
-Safe decompression encodes the input position of a failure in its negative
-return value. Differential tests compare both produced bytes and exact return
-values on malformed and truncated input. This catches bounds decisions that
-ordinary round trips cannot observe.
-
-`make difftest` currently covers:
-
-- Fast block compression across table types, capacities, and input patterns.
-- Streaming and dictionary state transitions.
-- HC levels 1 through 12, including fill-output behavior and state transcripts.
-- Frame compression for eight preference combinations: linked and independent
-  blocks, checksums, block sizes, declared content size, and fast acceleration.
-- Block decompression rejection parity around the decoder's fast-path margins.
-
-The command does not currently cover malformed frame decompression or HC levels
-3 and above through the frame API. A zero-divergence result applies only to the
-matrix above.
-
-### Keep verification claims reproducible
-
-`make test` runs the unmodified upstream suite. `make provenance-check` checks
-the primary `lz4.o` provenance needed to attribute that result to the port.
-`make difftest` checks output and rejection behavior that the suite cannot see.
-None of those commands alone establishes all three properties.
 
 ## 8. Compatibility-Critical Implementation Choices
 

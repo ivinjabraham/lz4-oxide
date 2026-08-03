@@ -807,7 +807,7 @@ unsafe fn decompress_fast_continue_impl(
 }
 
 /// `Result` in, C integer convention out — done once, per function, because
-/// the conventions differ between families (DECISIONS.md section 6).
+/// the conventions differ between families.
 #[inline]
 fn decode_result(r: Result<usize, BlockError>) -> c_int {
     match r {

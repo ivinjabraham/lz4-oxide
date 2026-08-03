@@ -478,8 +478,8 @@ has to be dealt with eventually.
 
 Port structure first, cleverness never. A faithful, boring translation that
 matches C byte for byte scores far better than idiomatic Rust that diverges.
-The place to be idiomatic is error handling and the internal API shape
-([DECISIONS.md section 6](DECISIONS.md)) — not the search loops.
+The place to be idiomatic is error handling and the internal API shape — not
+the search loops.
 
 ---
 
