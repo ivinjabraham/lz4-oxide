@@ -1,7 +1,5 @@
 # DECISIONS.md
 
-> The reference implementation is upstream LZ4 commit `0774d05537f9762f838f7ab541b7765f1a729cb5`.
-
 # 1. Scope
 
 The port covers the public library implemented by:
