@@ -243,19 +243,3 @@ builds still export it, but a Windows DLL build can omit it because the missing
 macro normally supplies `__declspec(dllexport)`. The ABI generator found the
 discrepancy by comparing header declarations with symbols in the compiled
 archive.
-
-## 10. Verification
-
-Use these commands for current evidence rather than copying volatile counts or
-performance values into this file:
-
-```sh
-make difftest          # byte identity and covered rejection parity
-make test              # complete unmodified upstream suite
-make abi-check         # exported symbol contract
-make provenance-check  # each binary's lz4.o comes from cstub/
-make kickoff-verify    # pinned upstream and unmodified tests
-make unsafe-count      # unsafe remains confined to src/ffi.rs
-cargo test             # Rust unit tests and xxHash oracle checks
-bench/bench.py         # regenerate benchmark results and environment metadata
-```
