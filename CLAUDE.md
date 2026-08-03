@@ -49,9 +49,9 @@ the status.
 - Rust may be installed but absent from an existing shell's PATH:
   `source "$HOME/.cargo/env"`.
 - Two separate build traps can produce a green test suite that is exercising
-  **C, not Rust** (see DECISIONS.md section 2). The `C_SRCDIRS` / `LDLIBS` /
-  `-o lz4` machinery in `Makefile` handles both; do not simplify it. Use
-  `make provenance-check` to confirm each binary's `lz4.o` uses `cstub/`.
+  **C, not Rust** (see README.md "How it fits together"). The `C_SRCDIRS` /
+  `LDLIBS` / `-o lz4` machinery in `Makefile` handles both; do not simplify it.
+  Use `make provenance-check` to confirm each binary's `lz4.o` uses `cstub/`.
 
 ## Commands
 

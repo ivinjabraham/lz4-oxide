@@ -78,7 +78,7 @@ into planning or decision documents.
 - Do not run `make gen-ffi` during normal development; it overwrites the
   implemented `src/ffi.rs`.
 - Do not simplify the `C_SRCDIRS`, `LDLIBS`, CLI prebuild, or provenance logic
-  without reviewing [DECISIONS.md section 2](DECISIONS.md).
+  without reviewing [README.md](README.md#how-it-fits-together).
 
 ## Setup
 

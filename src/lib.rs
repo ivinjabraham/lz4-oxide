@@ -12,7 +12,7 @@
 //!              port is confined to `ffi` and is measurable for the write-up.
 //!
 //! Build produces `liblz4_rs.a`, which the *unmodified* original C test suite
-//! links in place of the C objects. See DECISIONS.md section 2.
+//! links in place of the C objects. See README.md "How it fits together".
 
 #![allow(non_camel_case_types, non_snake_case)]
 

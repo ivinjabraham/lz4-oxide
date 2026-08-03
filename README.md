@@ -92,8 +92,9 @@ The one subtlety: lz4's tests don't link `liblz4.a` at all, they compile
 `LDLIBS`) rather than by editing anything. 
 
 The upstream CLI itself remains C, but its library calls resolve to Rust, so the
-original shell tests exercise the port end to end. [DECISIONS.md section
-2](DECISIONS.md) explains the test and CLI build redirects.
+original shell tests exercise the port end to end. `make provenance-check`
+confirms each built binary's `lz4.o` actually came from `cstub/`, not a stale
+C object.
 
 ### Layout
 

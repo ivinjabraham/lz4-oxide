@@ -1,17 +1,8 @@
 # DECISIONS.md
 
-This file records the decisions that define the port: its scope, ABI strategy,
-safety boundary, compatibility requirements, and known divergences. Current
-work belongs in [PLAN.md](PLAN.md), porting traps belong in
-[PORTING.md](PORTING.md), and generated performance numbers belong in
-[`bench/results.json`](bench/results.json).
+> The reference implementation is upstream LZ4 commit `0774d05537f9762f838f7ab541b7765f1a729cb5`.
 
-The reference implementation is upstream LZ4 commit
-`0774d05537f9762f838f7ab541b7765f1a729cb5`.
-
-## 1. Scope
-
-### Port the library, not the CLI
+# 1. Scope
 
 The port covers the public library implemented by:
 
@@ -31,60 +22,6 @@ limit.
 The C CLI remains unchanged and links against the Rust library. This keeps the
 ported scope within the hackathon's source-line limit while making the original
 CLI integration tests exercise the Rust implementation end to end.
-
-The library itself creates no threads and holds no locks. Its concurrency
-contract is therefore the absence of hidden mutable global state and the
-ability to share immutable objects such as `LZ4_CDict`. The implementation uses
-caller-owned or context-owned state and no mutable globals. The upstream CLI's
-threaded tests exercise this design on covered paths, but they are not a race
-detector.
-
-### This is not a dependency wrapper
-
-`lz4_flex` is an independent Rust implementation of the LZ4 format. It does not
-provide liblz4's complete C ABI, caller-allocated state layouts, frame surface,
-or all HC strategies. This project ports the pinned repository's API and
-behavior and does not depend on `lz4_flex`.
-
-## 2. ABI and Build Architecture
-
-### Export the original library ABI
-
-The crate builds as `staticlib`, `cdylib`, and `rlib`. The C-facing artifacts
-export the same 141 `LZ4_*`, `LZ4F_*`, and namespaced `LZ4_XXH*` symbols as the
-pinned `liblz4.a`.
-
-The symbol contract was derived from the compiled C archive rather than only
-from headers. `make abi-check` compares that committed contract with the Rust
-archive. `tools/gen_ffi.py` was used to bootstrap `src/ffi.rs`; running
-`make gen-ffi` now overwrites implemented bodies and must not be part of normal
-development.
-
-### Run the unmodified upstream tests against Rust
-
-Upstream tests compile `lib/*.c` directly instead of linking a prebuilt
-`liblz4.a`. The project redirects that build through two ordinary Make
-variables:
-
-- `C_SRCDIRS` replaces upstream library sources with empty translation units in
-  `cstub/`.
-- `LDLIBS` links `target/release/liblz4_rs.a` and Rust's native static-library
-  dependencies.
-
-The test Makefile clears `MAKEFLAGS` while building the CLI, so the CLI is built
-separately with the same overrides and marked complete when the suite runs.
-Without that step, shell tests can pass while exercising C rather than Rust.
-
-Upstream's object cache does not include `C_SRCDIRS` in its cache key. A stale C
-`lz4.o` can therefore be linked into an apparently Rust-backed test binary.
-`make provenance-check` inspects each binary's `lz4.d` and requires its primary
-`lz4.o` to come from `cstub/`. It catches the known stale-object failure mode;
-it is not a complete audit of every object in the binary.
-
-`test-amalgamation` is the one deliberate exception to the statement that
-upstream C implementation sources are not used by test binaries. It compiles an
-amalgamated C source as a standards-conformance check but does not link that
-object into a tested executable.
 
 ## 3. Layout and Ownership
 
