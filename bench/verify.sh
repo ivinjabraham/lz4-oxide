@@ -83,7 +83,13 @@ if data:
     elif which == 'truncated':   data = data[:max(1, len(data)//2)]
 open(sys.argv[2], 'wb').write(bytes(data))
 EOF
-    for cap in 1 2 3 4 5 6 7 8 11 12 15 16 17 18 19 20 24 31 32 33 40 64 4096; do
+    # Capacities are chosen to straddle every margin the decoder branches on:
+    # LASTLITERALS 5, MFLIMIT/MATCH_SAFEGUARD_DISTANCE 12, the wildcopy step 8,
+    # the two-stage shortcut's 32, and LZ4_FAST_DEC_LOOP's 64. Each boundary is
+    # sampled at n-1, n and n+1, because the bugs found here were all
+    # off-by-one in a comparison against exactly such a margin.
+    for cap in 1 2 3 4 5 6 7 8 9 11 12 13 15 16 17 18 19 20 24 31 32 33 40 48 \
+               56 63 64 65 72 79 80 81 96 127 128 129 4096; do
       run "partial  $variant g$size cap=$cap"        "$SP/case.bin" q "$cap" "$cap"
       run "partial  $variant g$size cap=$cap t=1"    "$SP/case.bin" q "$cap" 1
       run "safe     $variant g$size cap=$cap"        "$SP/case.bin" x "$cap"
