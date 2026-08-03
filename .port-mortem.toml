@@ -28,14 +28,14 @@ artifact = "target/release/liblz4_rs.a"   # staticlib exporting liblz4's 141 sym
 
 [tests]
 # The original suite is consumed as a git submodule pinned at the commit above,
-# rather than vendored into tests/original/. It is therefore unmodified by
-# construction, and that is independently checkable two ways:
+# rather than vendored into tests/original/. Verify its integrity with:
 #
-#   make kickoff-verify   -> submodule tree clean AND 42 files match kickoff hashes
+#   make kickoff-verify   -> pinned, clean submodule AND 42 files match kickoff hashes
 #
-manifest    = "tests/KICKOFF.sha256"
-manifest_utc = "2026-08-01T10:05:00Z"
-path        = "upstream/tests"
+manifest                 = "tests/KICKOFF.sha256"
+kickoff_manifest_sha256  = "66a43e5a88ae6792a8f9fd6954e1d3306e89900a78429b031349b039b4a43cff"
+manifest_utc             = "2026-08-01T10:02:56Z"
+path                     = "upstream/tests"
 file_count  = 42
 modified    = false
 

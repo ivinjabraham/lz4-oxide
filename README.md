@@ -22,8 +22,7 @@ Last verified 2026-08-03 on x86_64 Linux with rustc 1.97.1 and gcc 16.1.1.
 | Original test files matching kickoff hashes | 42/42 | `make kickoff-verify` |
 | `unsafe` occurrences | 312, all in `ffi.rs` | `make unsafe-count` |
 | Exported C ABI | 141/141 symbols | `make abi-check` |
-| Block/frame identity and rejection parity | 1261/1261 | `bench/verify.sh` |
-| Frame and all 13 HC levels byte-identical | 116/116 | `fuzz/driver.sh` |
+| Differential identity and rejection parity (block, stream, frame, HC) | 1369/1369 | `make difftest` |
 
 The full evidence, methodology, and remaining limitations are recorded in
 [DECISIONS.md §0](DECISIONS.md).
@@ -136,8 +135,10 @@ make difftest
 
 On an 8 MB `datagen -P50` input, best-of-N throughput ranged from 0.66x–0.82x C
 for the measured decoders, 0.75x for HC level 9, and 0.36x for default
-compression. The commands, methodology, raw figures, and unsuccessful optimization probes are in
-[`bench/README.md`](bench/README.md) and [DECISIONS.md §8.4](DECISIONS.md).
+compression. The commands and methodology are in
+[`bench/methodology.md`](bench/methodology.md), structured measurements are in
+[`bench/results.json`](bench/results.json), and analysis is in
+[DECISIONS.md §8.4](DECISIONS.md).
 
 ## License
 

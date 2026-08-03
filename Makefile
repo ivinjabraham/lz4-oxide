@@ -155,21 +155,16 @@ test-quick: $(RUST_LIB)
 #
 # This is the half `make test` structurally cannot do. Upstream's tests are
 # round-trips and CRCs, so compressed output that is wrong but *valid* passes
-# them, and so does an error returned at the wrong offset. Both harnesses below
-# compile the same C program twice -- once against upstream/lib/liblz4.a, once
-# against our archive -- and compare the bytes.
+# them, and so does an error returned at the wrong offset. The driver compiles
+# every harness twice -- once against upstream/lib/liblz4.a and once against our
+# archive -- then compares the bytes. It covers block, stream, frame, HC, and
+# malformed-input rejection parity, including position-encoded decoder failures
+# at boundary capacities.
 #
-#   fuzz/driver.sh    frame format, and every HC level, byte-for-byte
-#   bench/verify.sh   block + frame codecs, plus rejection parity: decode
-#                     capacities swept across the fast path's margins on
-#                     corrupt and truncated input, comparing the
-#                     position-encoded return code
-#
-# Both build the C reference, so this needs a working gcc as well as cargo.
+# It builds the C reference, so this needs a working gcc as well as cargo.
 .PHONY: difftest
 difftest: $(RUST_LIB)
 	$(CURDIR)/fuzz/driver.sh
-	$(CURDIR)/bench/verify.sh
 
 # ---------------------------------------------------------------------------
 # Submission evidence

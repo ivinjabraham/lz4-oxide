@@ -25,8 +25,8 @@ rustc 1.97.1 (8bab26f4f), gcc 16.1.1, against upstream lz4 pinned at `0774d055`.
 | Rust archive exports exactly the original ABI | `make abi-check` | **141/141, zero diff** |
 | Original C tests link against the port | `make link-check` | **pass** |
 | No test binary contains a C implementation object | `make provenance-check` | **6/6 from `cstub/`** |
-| Block + frame codecs byte-identical to C, and reject identically | `bench/verify.sh` | **1261/1261** |
-| Frame codec + **all 13 HC levels** byte-identical to C | `fuzz/driver.sh` | **116/116 identical** (§8.2) |
+| Block + frame codecs byte-identical to C, and reject identically | `fuzz/driver.sh` | **1261/1261** |
+| HC levels 1-12 byte-identical to C | `fuzz/driver.sh` | **108/108 identical** (§8.2) |
 | Upstream tree unmodified | `git -C upstream status --short` | **empty** |
 | Original test files match their kickoff hashes | `make kickoff-verify` | **42/42** |
 | `unsafe` confined to `src/ffi.rs` | `make unsafe-count` | **312, all in `ffi.rs`** |
@@ -46,7 +46,7 @@ suite passed, and the only implementation in those binaries was Rust.
 
 **Row 6 covers what the suite structurally cannot.** Upstream's tests are
 round-trips and CRCs, so wrong-but-valid compressed output passes them, and so
-does an error returned at the wrong offset. `bench/verify.sh` compiles the
+does an error returned at the wrong offset. `fuzz/driver.sh` compiles the
 `fuzz/` harnesses twice — against `upstream/lib/liblz4.a` and against
 `target/release/liblz4_rs.a` — and compares the bytes. It also sweeps decode
 capacities across the fast path's 32-byte margin on corrupt and truncated input
@@ -725,7 +725,7 @@ run-to-run noise.
 `upstream/tests/fullbench`, built twice from the same `tests/Makefile` and
 confirmed by `make provenance-check` to link no `lib/*.c` object. 8 MB inputs,
 best-of-N, because single runs cannot resolve anything under ~13% here.
-`bench/bench.sh` and `bench/verify.sh` reproduce all of it.
+`bench/bench.sh` and `fuzz/driver.sh` reproduce all of it.
 
 | vs C | `-P20` | `-P50` | `-P90` | 8 MB zeroes |
 |---|---|---|---|---|
@@ -794,7 +794,7 @@ discriminates is **the return code** — LZ4 position-encodes decode errors
 (`-(ip-src)-1`, lz4.c:2462), so comparing the integer compares *where* each
 implementation decided the block was malformed, not merely that it did.
 
-`bench/verify.sh` sweeps `LZ4_decompress_safe` and
+`fuzz/driver.sh` sweeps `LZ4_decompress_safe` and
 `LZ4_decompress_safe_partial` at capacities 1..4096 across the 32-byte margin,
 over clean, header-corrupted, mid-corrupted, tail-corrupted and truncated
 input, comparing that return code and a hash of the bytes actually produced:
@@ -897,7 +897,7 @@ where C merely reads a word past the match end, which is why it is still there.
       Killed decompressors #5/#6/#8 in `fullbench` and stopped `make test` at
       `test-fullbench`. `make test` now exits 0 end to end.
 - [ ] Differential fuzz harness (C reference vs Rust, valid **and** malformed input)
-      — `fuzz/hc_difftest.c` covers the HC surface (§8.2); `bench/verify.sh`
+      — `fuzz/hc_difftest.c` covers the HC surface (§8.2); `fuzz/driver.sh`
       covers the block and frame codecs on valid input and the block decoder on
       malformed input, **including rejection parity** (§8.4, 1261 comparisons).
       Missing: the frame decoder on malformed input, and a generative loop
@@ -909,7 +909,7 @@ where C merely reads a word past the match end, which is why it is still there.
       many-short-sequence data. Deliberately *not* attempted before the
       deadline: it introduces new margin comparisons (`ip < iend-15`,
       `op < oend-64`) in exactly the class that produced two crashes and a
-      flaky suite, and `bench/verify.sh`'s capacity sweep covers the 32-byte
+      flaky suite, and `fuzz/driver.sh`'s capacity sweep covers the 32-byte
       shortcut margin but not a 64-byte one. Whoever picks it up should extend
       that sweep **first**, then write the margins additively from the outset.
 - [x] **Monomorphising the hot loops was measured and is not the win it looks

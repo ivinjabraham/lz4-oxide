@@ -244,7 +244,7 @@ written, even where the reason for a particular `-5` or `-12` is not obvious.
 >
 > Only reachable with a tiny output buffer — `LZ4_decompress_safe_partial` with
 > a small `targetOutputSize`, or a small `dstCapacity`. Round-trip tests cannot
-> see it at all. `bench/verify.sh` sweeps capacities across the margin on
+> see it at all. `fuzz/driver.sh` sweeps capacities across the margin on
 > corrupt and truncated input and compares return codes; that is what found it.
 
 > ⚠️ **"It's only a fast path" is a claim to check, not to assume.** The

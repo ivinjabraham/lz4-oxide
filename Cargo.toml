@@ -15,6 +15,10 @@ name = "lz4_rs"
 path = "src/lib.rs"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[[test]]
+name = "port"
+path = "tests/port/safe_helpers.rs"
+
 [dependencies]
 # None. xxHash is implemented in-tree (src/xxh.rs) rather than taken from a
 # crate: XXH32_state_t/XXH64_state_t are declared on the C test's stack, so

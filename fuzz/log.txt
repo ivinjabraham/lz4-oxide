@@ -1,0 +1,43 @@
+# Differential Fuzz Run Log
+
+## Run 2026-08-03
+
+- Start (UTC): `2026-08-03T13:20:24Z`
+- End (UTC): `2026-08-03T13:21:29Z`
+- Continuous duration: 65 seconds
+- Completed `make difftest` iterations: 8
+- Failed iterations: 0
+- Per-iteration result: `byte-identical: 1369    diverged: 0`
+- Upstream commit: `0774d05537f9762f838f7ab541b7765f1a729cb5`
+- Rust: `rustc 1.97.1 (8bab26f4f 2026-07-14)`
+- C compiler: `gcc (GCC) 14.3.0`
+
+## Reproduce
+
+From the repository root, run this Bash loop. It continues invoking the full
+differential suite until at least 60 seconds have elapsed and exits non-zero on
+any failing iteration:
+
+```sh
+start_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+started=$SECONDS
+deadline=$((SECONDS + 65))
+runs=0
+failures=0
+while [ "$SECONDS" -lt "$deadline" ]; do
+    if make difftest; then
+        runs=$((runs + 1))
+    else
+        failures=$((failures + 1))
+        break
+    fi
+done
+elapsed=$((SECONDS - started))
+printf 'start=%s elapsed_seconds=%s completed_runs=%s failed_runs=%s\n' \
+    "$start_utc" "$elapsed" "$runs" "$failures"
+test "$failures" -eq 0 && test "$elapsed" -ge 60
+```
+
+The run needs Rust, `gcc`, `make`, Python 3, and the initialized `upstream/`
+submodule. Harness artifacts are written outside the repository under
+`${LZ4_BENCH_WORK:-${TMPDIR:-/tmp}/lz4-oxide-bench}` or `/tmp`.
