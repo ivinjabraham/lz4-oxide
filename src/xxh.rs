@@ -9,14 +9,14 @@
 const PRIME32_1: u32 = 2654435761;
 const PRIME32_2: u32 = 2246822519;
 const PRIME32_3: u32 = 3266489917;
-const PRIME32_4: u32 =  668265263;
-const PRIME32_5: u32 =  374761393;
+const PRIME32_4: u32 = 668265263;
+const PRIME32_5: u32 = 374761393;
 
 const PRIME64_1: u64 = 11400714785074694791;
 const PRIME64_2: u64 = 14029467366897019727;
-const PRIME64_3: u64 =  1609587929392839161;
-const PRIME64_4: u64 =  9650029242287828579;
-const PRIME64_5: u64 =  2870177450012600261;
+const PRIME64_3: u64 = 1609587929392839161;
+const PRIME64_4: u64 = 9650029242287828579;
+const PRIME64_5: u64 = 2870177450012600261;
 
 pub const VERSION_NUMBER: u32 = 605; // 0 *100*100 + 6*100 + 5
 
@@ -38,14 +38,14 @@ pub const VERSION_NUMBER: u32 = 605; // 0 *100*100 + 6*100 + 5
 #[derive(Clone, Copy)]
 pub(crate) struct Xxh32State {
     pub total_len_32: u32,
-    pub large_len:    u32,
+    pub large_len: u32,
     pub v1: u32,
     pub v2: u32,
     pub v3: u32,
     pub v4: u32,
-    pub mem:    [u8; 16], // was uint32_t mem32[4] in C
+    pub mem: [u8; 16], // was uint32_t mem32[4] in C
     pub memsize: u32,
-    pub reserved: u32,    // never read or written per C comment
+    pub reserved: u32, // never read or written per C comment
 }
 
 #[repr(C)]
@@ -56,7 +56,7 @@ pub(crate) struct Xxh64State {
     pub v2: u64,
     pub v3: u64,
     pub v4: u64,
-    pub mem:     [u8; 32], // was uint64_t mem64[4] in C
+    pub mem: [u8; 32], // was uint64_t mem64[4] in C
     pub memsize: u32,
     pub reserved: [u32; 2], // never read or written per C comment
 }
@@ -120,7 +120,8 @@ pub(crate) fn xxh32(data: &[u8], seed: u32) -> u32 {
             p = &p[16..];
         }
 
-        h = v1.rotate_left(1)
+        h = v1
+            .rotate_left(1)
             .wrapping_add(v2.rotate_left(7))
             .wrapping_add(v3.rotate_left(12))
             .wrapping_add(v4.rotate_left(18));
@@ -134,12 +135,12 @@ pub(crate) fn xxh32(data: &[u8], seed: u32) -> u32 {
 
 pub(crate) fn xxh32_reset(s: &mut Xxh32State, seed: u32) {
     s.total_len_32 = 0;
-    s.large_len    = 0;
+    s.large_len = 0;
     s.v1 = seed.wrapping_add(PRIME32_1).wrapping_add(PRIME32_2);
     s.v2 = seed.wrapping_add(PRIME32_2);
     s.v3 = seed;
     s.v4 = seed.wrapping_sub(PRIME32_1);
-    s.mem     = [0; 16];
+    s.mem = [0; 16];
     s.memsize = 0;
     // reserved intentionally left untouched
 }
@@ -241,12 +242,18 @@ fn xxh64_finalize(mut h: u64, data: &[u8]) -> u64 {
     for _ in 0..(n / 8) {
         let k1 = xxh64_round(0, u64::from_le_bytes(p[..8].try_into().unwrap()));
         h ^= k1;
-        h = h.rotate_left(27).wrapping_mul(PRIME64_1).wrapping_add(PRIME64_4);
+        h = h
+            .rotate_left(27)
+            .wrapping_mul(PRIME64_1)
+            .wrapping_add(PRIME64_4);
         p = &p[8..];
     }
     if n % 8 >= 4 {
         h ^= (u32::from_le_bytes(p[..4].try_into().unwrap()) as u64).wrapping_mul(PRIME64_1);
-        h = h.rotate_left(23).wrapping_mul(PRIME64_2).wrapping_add(PRIME64_3);
+        h = h
+            .rotate_left(23)
+            .wrapping_mul(PRIME64_2)
+            .wrapping_add(PRIME64_3);
         p = &p[4..];
     }
     for _ in 0..(n % 4) {
@@ -277,7 +284,8 @@ pub(crate) fn xxh64(data: &[u8], seed: u64) -> u64 {
             p = &p[32..];
         }
 
-        h = v1.rotate_left(1)
+        h = v1
+            .rotate_left(1)
             .wrapping_add(v2.rotate_left(7))
             .wrapping_add(v3.rotate_left(12))
             .wrapping_add(v4.rotate_left(18));
@@ -299,7 +307,7 @@ pub(crate) fn xxh64_reset(s: &mut Xxh64State, seed: u64) {
     s.v2 = seed.wrapping_add(PRIME64_2);
     s.v3 = seed;
     s.v4 = seed.wrapping_sub(PRIME64_1);
-    s.mem     = [0; 32];
+    s.mem = [0; 32];
     s.memsize = 0;
     // Quirk, preserved deliberately: C's XXH64_reset copies
     // `sizeof(state) - sizeof(state.reserved)` = 80 bytes, but `reserved`
@@ -350,10 +358,11 @@ pub(crate) fn xxh64_update(s: &mut Xxh64State, input: &[u8]) {
 
 pub(crate) fn xxh64_digest(s: &Xxh64State) -> u64 {
     let mut h: u64 = if s.total_len >= 32 {
-        let mut h = s.v1.rotate_left(1)
-            .wrapping_add(s.v2.rotate_left(7))
-            .wrapping_add(s.v3.rotate_left(12))
-            .wrapping_add(s.v4.rotate_left(18));
+        let mut h =
+            s.v1.rotate_left(1)
+                .wrapping_add(s.v2.rotate_left(7))
+                .wrapping_add(s.v3.rotate_left(12))
+                .wrapping_add(s.v4.rotate_left(18));
         h = xxh64_merge_round(h, s.v1);
         h = xxh64_merge_round(h, s.v2);
         h = xxh64_merge_round(h, s.v3);

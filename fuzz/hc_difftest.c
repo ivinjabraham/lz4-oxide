@@ -4,10 +4,9 @@
  * loaded dictionary, `saveDictHC`, the two `destSize` (fillOutput) entry points,
  * and compression against an attached dictionary context.
  *
- * Levels 1-2 select C's `lz4mid` strategy and must be **byte-identical**.
- * Levels 3+ select the hash-chain and optimal parsers, which are not ported;
- * this harness therefore only asserts identity for the levels passed on the
- * command line. See DECISIONS.md §8.2.
+ * Levels 1-2 select C's `lz4mid` strategy, levels 3-9 select the greedy
+ * hash-chain parser, and levels 10-12 select the optimal parser. The harness
+ * asserts byte identity for the level passed on the command line.
  *
  * Every result is emitted, including failures and the `srcSizePtr` written back
  * by the fillOutput calls: agreeing on *rejection* and on how much input was
@@ -138,10 +137,7 @@ int main(int argc, char** argv) {
     emit_state(stream);
 
     /* --- level clamping: <1 becomes 9, >12 becomes 12 ---
-     * Emitted as *self*-comparisons, not raw output: the levels these clamp to
-     * (9 and 12) use strategies this port does not implement, so their bytes
-     * legitimately differ from C. That clamping happens at all is still shared
-     * behaviour, and that is what is compared. */
+     * Emitted as self-comparisons so the transcript checks clamping directly. */
     {   char* const ref = malloc((size_t)bound);
         int r12, r9;
         r12 = LZ4_compress_HC(ref, ref, 0, bound, 12); /* silence unused warn */

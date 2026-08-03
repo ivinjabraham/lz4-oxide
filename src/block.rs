@@ -2044,12 +2044,7 @@ const DEC64_TABLE: [isize; 8] = [0, 0, 0, -1, -4, 1, 2, 3];
 /// The second four are a bulk copy, because the adjusted source is disjoint
 /// from them for every offset in range.
 #[inline]
-fn short_offset_prologue(
-    buf: &mut [u8],
-    dst_at: usize,
-    match_at: usize,
-    offset: usize,
-) -> usize {
+fn short_offset_prologue(buf: &mut [u8], dst_at: usize, match_at: usize, offset: usize) -> usize {
     for i in 0..4 {
         buf[dst_at + i] = buf[match_at + i];
     }

@@ -38,11 +38,9 @@ for m in 0 1 2 3 4 5 6 7; do
 done
 
 echo "========= Running hc_difftest =========="
-# Only levels 1-2 are compared: they select C's lz4mid strategy, the one this
-# port implements. Levels 3-12 use the hash-chain and optimal parsers, which are
-# not ported, so their output legitimately differs -- see DECISIONS.md 8.2.
+# Exercise all three HC strategies: lz4mid, greedy hash chain, and optimal.
 build hc_difftest
-for lvl in 1 2; do
+for lvl in 1 2 3 4 5 6 7 8 9 10 11 12; do
     for sz in 20K 300K 1M; do
         for p in 10 50 90; do
             ../upstream/tests/datagen -g"$sz" -P"$p" > /tmp/hcin

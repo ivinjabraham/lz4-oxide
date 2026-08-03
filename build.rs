@@ -115,7 +115,9 @@ fn main() {
         build.arg(format!("-DLZ4_MEMORY_USAGE={mu}"));
     }
 
-    let status = build.status().expect("failed to invoke C compiler for layout probe");
+    let status = build
+        .status()
+        .expect("failed to invoke C compiler for layout probe");
     assert!(status.success(), "layout probe failed to compile");
 
     let out = Command::new(&probe_bin).output().expect("run layout probe");

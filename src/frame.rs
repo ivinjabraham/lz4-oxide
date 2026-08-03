@@ -1159,7 +1159,14 @@ pub fn decompress(
                     let hdr = read_le32(&src[sp..]);
                     sp += BH_SIZE;
                     decode_block_header(
-                        dctx, hdr, op, dst_end, sp, src_end, &mut hint, &mut another,
+                        dctx,
+                        hdr,
+                        op,
+                        dst_end,
+                        sp,
+                        src_end,
+                        &mut hint,
+                        &mut another,
                     )?;
                 } else {
                     dctx.tmp_in_size = 0;
@@ -1238,8 +1245,7 @@ pub fn decompress(
                     let still = 4 - dctx.tmp_in_size;
                     let size_to_copy = still.min(src_end - sp);
                     let at = dctx.tmp_in_size;
-                    dctx.header[at..at + size_to_copy]
-                        .copy_from_slice(&src[sp..sp + size_to_copy]);
+                    dctx.header[at..at + size_to_copy].copy_from_slice(&src[sp..sp + size_to_copy]);
                     dctx.tmp_in_size += size_to_copy;
                     sp += size_to_copy;
                     if dctx.tmp_in_size < 4 {

@@ -197,7 +197,13 @@ macro_rules! opaque {
     )*};
 }
 
-opaque!(LZ4F_cctx, LZ4F_dctx, LZ4F_CDict, LZ4_readFile_t, LZ4_writeFile_t);
+opaque!(
+    LZ4F_cctx,
+    LZ4F_dctx,
+    LZ4F_CDict,
+    LZ4_readFile_t,
+    LZ4_writeFile_t
+);
 
 /// C `FILE`. Only ever passed through to the C stdio the caller owns.
 #[repr(C)]
