@@ -1,4 +1,4 @@
-# Decision Log: LZ4 C to Rust
+# DECISIONS.md
 
 This file records the decisions that define the port: its scope, ABI strategy,
 safety boundary, compatibility requirements, and known divergences. Current
@@ -45,16 +45,6 @@ detector.
 provide liblz4's complete C ABI, caller-allocated state layouts, frame surface,
 or all HC strategies. This project ports the pinned repository's API and
 behavior and does not depend on `lz4_flex`.
-
-### This is not source-language runtime linking
-
-The eligibility rules separately bar leaning on the *source language's*
-runtime (e.g. a Rust program shelling out to a Python interpreter). C has no
-such runtime, and none is linked. The only C left in the built test binaries
-is the harness itself, which the rules require to stay unmodified, plus the
-CLI, kept by choice. Every `LZ4_*`/`LZ4F_*` symbol the test binaries reference
-resolves into Rust; `make provenance-check` verifies no `lib/*.c` object
-participates in the link.
 
 ## 2. ABI and Build Architecture
 
