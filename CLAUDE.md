@@ -7,16 +7,25 @@ the porting traps and the byte-identity check are in [PORTING.md](PORTING.md).
 
 ## The loop
 
-Run a test, read the `not implemented: LZ4_xxx` panic, implement that function,
-repeat. The next thing to write is whatever the panic names:
+**The porting loop is finished.** Every exported symbol has a body, no
+`unimplemented!()` remains, and `make test` passes end to end. `fuzzer -i1` no
+longer names anything to write.
+
+What replaces it, for any change from here:
 
 ```sh
-stdbuf -oL ./upstream/tests/fuzzer -i1
+make difftest     # byte-identity AND rejection parity vs the pinned C library
+make test         # the score — the full unmodified upstream suite
 ```
 
+`make difftest` is the one that matters while editing. The upstream suite is
+round-trips and CRCs, so it cannot see compressed output that is wrong but
+*valid*, nor an error returned at the wrong offset — and both have happened
+here (DECISIONS.md §8.2, §8.4). Run it before you trust a green suite.
+
 **Do not record which functions are done** — not here, not in PLAN.md. That is
-a doc edit per commit and it goes stale between them. The command above is the
-status; `make test` is the score.
+a doc edit per commit and it goes stale between them. The commands above are
+the status.
 
 ## Rules
 

@@ -14,20 +14,20 @@ to bottom once; it should take about five minutes.
 
 ## 1. Status at a glance
 
-> **The scaffold is proven; the port is being written.** What exists for
-> certain is the machinery that lets lz4's own C test suite run against our
-> Rust code. Do not mistake a green `make link-check` for a working port.
+> **The port is written and the suite passes.** Every exported symbol has a
+> body, `make test` exits 0 end to end, and all 13 HC levels plus the block and
+> frame codecs are byte-identical to the C library.
 >
-> **Where the port stops right now is derivable — no doc to trust, and none to
-> update:**
+> **Status is still derivable rather than recorded here:**
 >
 > ```sh
-> stdbuf -oL ./upstream/tests/fuzzer -i1   # panics naming the next symbol to write
-> make test                                # the actual score
+> make test        # the score — the full unmodified upstream suite
+> make difftest    # byte-identity and rejection parity vs pinned C
 > ```
 >
-> Deliberately no per-function checklist here: it would need an edit per commit
-> and would be wrong between them.
+> Deliberately no per-function checklist: it would need an edit per commit and
+> would be wrong between them. What is *not* done is in DECISIONS.md §0 under
+> "what is still not true", and §9.
 
 | | State |
 |---|---|
@@ -183,13 +183,18 @@ Ordered so each step unlocks the most tests per hour.
 | # | Step | Owner | Files | Unlocks |
 |---|---|---|---|---|
 | 1 | Skeleton links | — | — | ✅ **done** |
-| 2 | Basic compress / decompress | **A** | `src/block.rs` | most of `fuzzer` |
-| 3 | Frame format + checksums | **B** | `src/frame.rs`, `src/xxh.rs` | `frametest` + all `test-lz4-*.sh` |
-| 4 | Streaming + dictionary | **A** | `src/block.rs` | rest of `fuzzer` |
-| 5 | HC, levels ≤2 (`lz4mid`) and 3–9 (`lz4hc` hash chain) | **C** | `src/hc.rs` | `test-lz4hc` |
-| 6 | Optimal parser, levels 10–12 (`lz4opt`) | **C** | `src/hc.rs` | ~23% of `fuzzer` cycles — see below |
+| 2 | Basic compress / decompress | **A** | `src/block.rs` | ✅ **done** |
+| 3 | Frame format + checksums | **B** | `src/frame.rs`, `src/xxh.rs` | ✅ **done** |
+| 4 | Streaming + dictionary | **A** | `src/block.rs` | ✅ **done** |
+| 5 | HC, levels ≤2 (`lz4mid`) and 3–9 (`lz4hc` hash chain) | **C** | `src/hc.rs` | ✅ **done** |
+| 6 | Optimal parser, levels 10–12 (`lz4opt`) | **C** | `src/hc.rs` | ✅ **done** |
 
-Steps 2–3 give a genuinely working lz4. Steps 4–6 buy score.
+All six are done and byte-identical to C. §6.1 below is kept because its
+*reasoning* is what made step 6 get finished rather than cut — and because the
+fallback it describes was in fact taken for a while, silently, with a green
+suite the whole time (DECISIONS.md §8.2).
+
+What remains is not implementation: see DECISIONS.md §9.
 
 ### 6.1 The optimal parser is not the cheap cut it looks like
 

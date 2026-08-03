@@ -805,6 +805,48 @@ predate the copy work entirely**. They were a pre-existing rejection-parity gap
 in `LZ4_decompress_safe` on corrupt input at small capacities, invisible to
 every test the project had, and the same additive guards fix them.
 
+### Where the port stands against C, and three places the gap is *not*
+
+2026-08-03, 8 MB `datagen -P50`, `bench/bench.sh` best-of-N. Run-to-run spread
+on this host is ~13%, so treat anything closer than that as equal.
+
+| | C MB/s | Rust MB/s | ratio |
+|---|---|---|---|
+| `LZ4_decompress_fast` | 4796 | 3955 | 0.82x |
+| `LZ4_compress_HC` (level 9) | 81 | 61 | 0.75x |
+| `LZ4_decompress_safe` | 7802 | 5121 | 0.66x |
+| `LZ4_decompress_safe_usingDict` | 7886 | 5177 | 0.66x |
+| `LZ4_compress_default` | 1318 | 470 | **0.36x** |
+
+Decode is close to C; encode is not. `LZ4_decompress_fast` was 0.28x until the
+bulk-read change — it was reading literal runs through the FFI's byte closure
+one indirect call per byte, and choosing between external/prefix/output per byte
+in the match copy.
+
+**Compression's 3x is diffuse, and that is a measured claim, not a shrug.**
+`lz4.c` uses `LZ4_FORCE_INLINE` 31 times and ships 27 instantiations of the
+compressor with the dict directive and table type burned in as constants, where
+we dispatch at run time — so specialisation looks like the obvious answer. It
+is not, on this host:
+
+| Hypothesis | Ablation | Effect |
+|---|---|---|
+| Hash read dispatch (`Input` + `TableType`) | hard-code the `Separate`/`byU32` path | **+5%** |
+| Per-call table allocation | compare `LZ4_compress_default` (allocates) against `_extState` (caller's state) | **0%** — 0.37x vs 0.36x |
+| Table bounds checks | mask the index by `ENTRIES-1` so the optimiser can prove it | **0%** |
+
+Three sites at 5% each is 15%, not 3x. The cost is spread thin — `Option`
+construction in `Hist::read32`, a bounds check per windowed read, no
+cross-function specialisation — rather than concentrated anywhere a single
+change can reach. Note the first probe *added* a fast-path branch instead of
+removing dispatch, so 5% is a floor rather than a ceiling; the conclusion
+survives either reading.
+
+**Method, so the numbers are legible:** this was ablation, not profiling.
+Neither `perf` nor `valgrind` is installed on the dev host, so each hypothesis
+was tested by changing one thing and re-measuring. That is why the table above
+lists what was ruled *out*: with no profile, a negative result is the evidence.
+
 ### One regression in fail-loudness, recorded deliberately
 
 `common_bytes` clamps its length against both slices, so a caller that violates
@@ -864,10 +906,18 @@ where C merely reads a word past the match end, which is why it is still there.
       is done and reproducible (§8.4, `bench/`); p99, RSS and startup are not
 - [ ] **Port `LZ4_FAST_DEC_LOOP`** (§8.4). The second of `block.rs`'s two stated
       departures, still untested, and the largest remaining decode lever on
-      many-short-sequence data. Needs rejection parity, not just round-trips.
-- [ ] **Monomorphise the hot loops over `Input` / `DictDirective` / table type**
-      (§8.4). C gets this from `LZ4_FORCE_INLINE`; we dispatch at run time on
-      every scanned position, which is most of what keeps compression at 0.36x.
+      many-short-sequence data. Deliberately *not* attempted before the
+      deadline: it introduces new margin comparisons (`ip < iend-15`,
+      `op < oend-64`) in exactly the class that produced two crashes and a
+      flaky suite, and `bench/verify.sh`'s capacity sweep covers the 32-byte
+      shortcut margin but not a 64-byte one. Whoever picks it up should extend
+      that sweep **first**, then write the margins additively from the outset.
+- [x] **Monomorphising the hot loops was measured and is not the win it looks
+      like** (§8.4). The `LZ4_FORCE_INLINE` count says specialise; ablation says
+      ~5% per site, against 0% for per-call allocation and 0% for table bounds
+      checks. Compression's gap is diffuse safe-Rust overhead. Recorded as a
+      closed question so nobody spends a day re-deriving it — if someone does
+      revisit it, get a profiler first, which this host did not have.
 - [ ] Paste organisers' eligibility ruling (§2)
 - [x] Confirm `LZ4F_compressOptions_t` / `LZ4F_decompressOptions_t` layouts
       against the probe — done, both asserted in `src/types.rs` (§5)
