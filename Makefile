@@ -151,6 +151,26 @@ test-reference:
 test-quick: $(RUST_LIB)
 	$(MAKE) -C $(ROOT)/tests test-fuzzer test-frametest $(TEST_OVERRIDES)
 
+# Differential comparison against the pinned C library.
+#
+# This is the half `make test` structurally cannot do. Upstream's tests are
+# round-trips and CRCs, so compressed output that is wrong but *valid* passes
+# them, and so does an error returned at the wrong offset. Both harnesses below
+# compile the same C program twice -- once against upstream/lib/liblz4.a, once
+# against our archive -- and compare the bytes.
+#
+#   fuzz/driver.sh    frame format, and every HC level, byte-for-byte
+#   bench/verify.sh   block + frame codecs, plus rejection parity: decode
+#                     capacities swept across the fast path's margins on
+#                     corrupt and truncated input, comparing the
+#                     position-encoded return code
+#
+# Both build the C reference, so this needs a working gcc as well as cargo.
+.PHONY: difftest
+difftest: $(RUST_LIB)
+	$(CURDIR)/fuzz/driver.sh
+	$(CURDIR)/bench/verify.sh
+
 # ---------------------------------------------------------------------------
 # Submission evidence
 # ---------------------------------------------------------------------------

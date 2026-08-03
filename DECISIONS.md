@@ -825,8 +825,15 @@ where C merely reads a word past the match end, which is why it is still there.
 
 ## 9. Open items
 
-- [ ] **Build the Dockerfile once.** It was written on a host without Docker,
-      so it is unverified — an untested one-step build is worse than none.
+- [ ] **Build the Dockerfile once.** Still unverified: no Docker on the dev
+      host, which is how it was written in the first place. Static review did
+      find one certain failure — `Dockerfile:92` called `make difftest`, which
+      did not exist, and the `verify` stage it sits in is a prerequisite of
+      `artifacts`, `full-test` and the default image, so **every** target would
+      have failed. The target now exists and passes. That is a reason to trust
+      the file less, not more, until someone runs `docker build --target verify .`
+      on a host that has Docker: a review can only catch what it thinks to look
+      for.
 - [ ] Push to a public GitHub repo; correct the URL in `.port-mortem.toml`.
 - [x] **Every exported symbol has a body — no `unimplemented!()` remains**, and
       `make test` passes end to end (§0). The panic-driven loop that `PLAN.md`
