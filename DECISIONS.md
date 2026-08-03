@@ -15,7 +15,7 @@ govern what goes inside it. §0 is the evidence table for both.
 
 ## 0. Verification status
 
-Last verified 2026-08-02 16:54 UTC on x86_64-unknown-linux-gnu,
+Last verified 2026-08-03 on x86_64-unknown-linux-gnu,
 rustc 1.97.1 (8bab26f4f), gcc 16.1.1, against upstream lz4 pinned at `0774d055`.
 
 | Claim | Command | Result |
@@ -26,10 +26,10 @@ rustc 1.97.1 (8bab26f4f), gcc 16.1.1, against upstream lz4 pinned at `0774d055`.
 | Original C tests link against the port | `make link-check` | **pass** |
 | No test binary contains a C implementation object | `make provenance-check` | **6/6 from `cstub/`** |
 | Block + frame codecs byte-identical to C, and reject identically | `bench/verify.sh` | **1261/1261** |
-| Frame codec + HC levels 1-2 byte-identical to C | `fuzz/driver.sh` | **26/26 identical** (§8.2) |
+| Frame codec + **all 13 HC levels** byte-identical to C | `fuzz/driver.sh` | **116/116 identical** (§8.2) |
 | Upstream tree unmodified | `git -C upstream status --short` | **empty** |
 | Original test files match their kickoff hashes | `make kickoff-verify` | **42/42** |
-| `unsafe` confined to `src/ffi.rs` | `make unsafe-count` | **307, all in `ffi.rs`** |
+| `unsafe` confined to `src/ffi.rs` | `make unsafe-count` | **312, all in `ffi.rs`** |
 | C reference suite is green *on this host* | `make test-reference` | **exit 0** (2026-08-01, [tests/README.md](tests/README.md#the-c-baseline--our-denominator)) |
 
 Three rows carry the weight, and they are not the obvious ones.
@@ -57,15 +57,11 @@ nothing else in the project could see either.
 
 **What is still not true**, so that row 1 is not read as "done":
 
-* **HC levels 3-12 do not reproduce C's bytes** (§8.2). They round-trip and pass
-  every CRC in the suite, but a caller asking for level 9 gets level-2
-  compression. This is 11 of 13 reachable levels and the largest known gap in
-  behavioural equivalence.
 * **One `frametest` unit assertion fails** — `LZ4F_cctx_size` against
   hook-counted allocation (§8.1). The randomized `fuzzerTests` that exercise the
   format are green.
 * **A debug build cannot run the fuzzer.** It aborts almost immediately on a
-  `slice::from_raw_parts` precondition check at `src/ffi.rs:171`, a null
+  `slice::from_raw_parts` precondition check at `src/ffi.rs:170`, a null
   `prefixStart` on the lz4hc path. Release is unaffected, but `debug_assert!`s
   and overflow checks are currently unreachable through the suite.
 * **Release builds lost one fail-loud property** in `common_bytes` (§8.4).
@@ -546,42 +542,40 @@ and fast level -3): **120 comparisons, all byte-identical.**
 
 ---
 
-## 8.2 HC: `lz4mid` is ported, the two parsers above it are not
+## 8.2 HC: all three strategies ported, all 13 levels byte-identical
 
 `lz4hc.c:420-436` picks one of three match finders by level, and `src/hc.rs`
-implements the first of them:
+implements all three:
 
 | Level | C strategy | Ported | Byte-identical to C |
 |---|---|---|---|
 | 1-2 | `lz4mid` | ✅ yes | ✅ **yes**, verified |
-| 3-9 | `lz4hc` (hash chain) | ❌ no | ❌ no — routed to `lz4mid` |
-| 10-12 | `lz4opt` (optimal parser) | ❌ no | ❌ no — routed to `lz4mid` |
+| 3-9 | `lz4hc` (hash chain) | ✅ yes | ✅ **yes**, verified |
+| 10-12 | `lz4opt` (optimal parser) | ✅ yes | ✅ **yes**, verified |
 
-This is the **"degrade, don't delete"** fallback named in PLAN.md §6.1, applied
-in the other direction than that section anticipated: rather than routing 10-12
-down to the level-9 hash chain, every level above 2 currently lands on `lz4mid`.
-The consequence is the same in kind — the output is well-formed LZ4 that
-round-trips and passes every CRC check in the suite, so `fuzzer` and `frametest`
-are green at all 13 levels — but a caller asking for level 9 gets level-2
-compression. Concretely, on 120 KB of 4-symbol noise: C emits 49,277 bytes at
-level 9 and 46,773 at level 11, where we emit 56,424 at every level.
+This section previously recorded the opposite, and it is worth keeping the
+reason it was written that way. Levels 3-12 were routed down to `lz4mid`: the
+output was well-formed LZ4 that round-tripped and passed every CRC in the
+suite, so `fuzzer` and `frametest` were green at all 13 levels — while a caller
+asking for level 9 got level-2 compression. On 120 KB of 4-symbol noise, C
+emitted 49,277 bytes at level 9 and 46,773 at level 11 where we emitted 56,424
+at every level.
 
-**What this costs.** Behavioural equivalence is 30% of the score, and levels 3-12
-are 11 of the 13 reachable values. `fuzzer.c:386` draws the level once per cycle
-and reuses it across ~15 HC call sites, so most cycles compress through a
-strategy whose *bytes* we do not reproduce — they are merely valid. Nothing in
-the upstream suite detects this, which is exactly why it is written down here:
-round-trip tests cannot see it, and `fuzz/hc_difftest.c` deliberately compares
-only levels 1-2 rather than reporting a failure it cannot fix.
+**Nothing in the upstream suite detected that**, and it would have cost 11 of
+13 reachable levels against the 30% of the score that is behavioural
+equivalence — `fuzzer.c:386` draws the level once per cycle and reuses it
+across ~15 HC call sites, so most cycles compressed through a strategy whose
+bytes we did not reproduce. It was visible only because this file said so and
+because `fuzz/hc_difftest.c` compared bytes against C rather than round-tripping.
+That is the argument for differential comparison in one paragraph: a green
+suite is evidence about crashes and CRCs, not about equivalence.
 
-**The one thing not to do** is treat the green suite as done. Finishing this
-means porting `LZ4HC_compress_hashChain` (with `LZ4HC_InsertAndGetWiderMatch`,
-the chain-swap and pattern-analysis paths) and `LZ4HC_compress_optimal`, plus the
-`chainTable` maintenance in `LZ4HC_Insert` — which `set_external_dict` and
-`LZ4_loadDictHC` also skip today, since no chain exists to maintain. Both skips
-are marked at their call sites in `src/ffi.rs` and `src/hc.rs`.
+Closing it meant `LZ4HC_compress_hashChain` (with `LZ4HC_InsertAndGetWiderMatch`
+and the chain-swap and pattern-analysis paths), `LZ4HC_compress_optimal`, and the
+`chainTable` maintenance in `LZ4HC_Insert` that `set_external_dict` and
+`LZ4_loadDictHC` had been able to skip while no chain existed to maintain.
 
-### What *is* verified for levels 1-2
+### What *is* verified, and the traps that made it hard
 
 The trap in porting `lz4mid` is that `LZ4HC_CCtx_internal` describes positions
 twice over: `prefixStart .. end` is one **contiguous** buffer holding the history
@@ -618,7 +612,8 @@ bookkeeping is emitted after each streaming call; pointers are not, being
 addresses rather than behaviour.
 
 Run over `datagen` output at 20 KB / 300 KB / 1 MB, each at `-P10/50/90`, at
-levels 1 and 2: **18 transcripts, all byte-identical** (`fuzz/driver.sh`).
+**every level 1-12: 108 transcripts, all byte-identical** (`fuzz/driver.sh`,
+which compares 116 including the frame codec).
 
 ---
 
@@ -825,12 +820,15 @@ where C merely reads a word past the match end, which is why it is still there.
       `make test` passes end to end (§0). The panic-driven loop that `PLAN.md`
       §5 and `CLAUDE.md` describe is finished; both still tell a newcomer to run
       `fuzzer -i1` and implement whatever it names, which now names nothing.
-- [ ] **Port the HC hash chain and optimal parser** (§8.2) — levels 3-12 are
-      routed to `lz4mid`, so 11 of 13 levels emit valid LZ4 that is not C's
-      bytes. The largest known behavioural-equivalence gap.
+- [x] **HC hash chain and optimal parser ported (2026-08-03), see §8.2.** All
+      13 levels are now byte-identical to C, verified by 108 `hc_difftest`
+      transcripts. This was the largest behavioural-equivalence gap, and only
+      differential comparison could see it — the upstream suite was green
+      throughout, because level-2 output for a level-9 request is still valid
+      LZ4 that round-trips and passes every CRC.
 - [ ] **Frame contexts: move the working buffers into the caller's allocator**
       (§8.1). One `frametest` unit assertion depends on it.
-- [ ] **Debug builds abort on a UB check** at `src/ffi.rs:171` —
+- [ ] **Debug builds abort on a UB check** at `src/ffi.rs:170` —
       `slice::from_raw_parts` on a null `prefixStart` in the lz4hc path, so the
       fuzzer cannot run under `PROFILE=debug` and no `debug_assert!` or
       overflow check is reachable through the suite. Release is unaffected.
